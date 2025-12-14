@@ -3,45 +3,381 @@ package service
 import (
 	"UASBE/app/model"
 	"UASBE/app/repository"
-	"UASBE/app/utils"
 	"errors"
+	"time"
 
-	"gorm.io/gorm"
+	"github.com/gofiber/fiber/v2"
+	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
-type AuthService interface {
-	Login(username, password string) (*model.LoginResponse, error)
+type AuthService struct {
+	userRepo     *repository.UserRepository
+	studentRepo  *repository.StudentRepository
+	lecturerRepo *repository.LecturerRepository
+	jwtSecret    string
 }
 
-type authService struct {
-	userRepo repository.UserRepository
+type LoginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
 }
 
-func NewAuthService(userRepo repository.UserRepository) AuthService {
-	return &authService{userRepo: userRepo}
+type LoginResponse struct {
+	Token       string             `json:"token"`
+	User        *model.User        `json:"user"`
+	Role        *model.Role        `json:"role"`
+	Permissions []model.Permission `json:"permissions"`
+	ExpiresAt   time.Time          `json:"expires_at"`
 }
 
-func (s *authService) Login(username, password string) (*model.LoginResponse, error) {
-	user, err := s.userRepo.FindByUsername(username)
+type RegisterRequest struct {
+	Username     string `json:"username"`
+	Email        string `json:"email"`
+	Password     string `json:"password"`
+	FullName     string `json:"full_name"`
+	Role         string `json:"role"` // "admin", "student", "lecturer"
+	StudentID    string `json:"student_id,omitempty"`
+	LecturerID   string `json:"lecturer_id,omitempty"`
+	ProgramStudy string `json:"program_study,omitempty"`
+	AcademicYear string `json:"academic_year,omitempty"`
+	Department   string `json:"department,omitempty"`
+}
+
+func NewAuthService(userRepo *repository.UserRepository, studentRepo *repository.StudentRepository, lecturerRepo *repository.LecturerRepository, jwtSecret string) *AuthService {
+	return &AuthService{
+		userRepo:     userRepo,
+		studentRepo:  studentRepo,
+		lecturerRepo: lecturerRepo,
+		jwtSecret:    jwtSecret,
+	}
+}
+
+func (s *AuthService) Login(req *LoginRequest) (*LoginResponse, error) {
+	// FR-001 Step 1: User mengirim kredensial
+	// Support login with username or email
+	user, err := s.getUserByCredential(req.Username)
 	if err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, errors.New("invalid username or password")
-		}
-		return nil, err
+		return nil, errors.New("invalid credentials")
 	}
 
-	if err := utils.CheckPassword(user.Password, password); err != nil {
-		return nil, errors.New("invalid username or password")
-	}
-
-	token, err := utils.GenerateToken(user.ID, user.Username, user.Role)
+	// FR-001 Step 2: Sistem memvalidasi kredensial
+	err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password))
 	if err != nil {
-		return nil, err
+		return nil, errors.New("invalid credentials")
 	}
 
-	return &model.LoginResponse{
-		Token:    token,
-		Username: user.Username,
-		Role:     user.Role,
+	// FR-001 Step 3: Sistem mengecek status aktif user
+	if !user.IsActive {
+		return nil, errors.New("account is deactivated")
+	}
+
+	// Get user role and permissions
+	role, permissions, err := s.getUserRoleAndPermissions(user.RoleID)
+	if err != nil {
+		return nil, errors.New("failed to get user role")
+	}
+
+	// FR-001 Step 4: Sistem generate JWT token dengan role dan permissions
+	token, expiresAt, err := s.generateTokenWithRoleAndPermissions(user.ID, user.Username, role, permissions)
+	if err != nil {
+		return nil, errors.New("failed to generate token")
+	}
+
+	// FR-001 Step 5: Return token dan user profile
+	// Remove password from response
+	user.Password = ""
+
+	return &LoginResponse{
+		Token:       token,
+		User:        user,
+		Role:        role,
+		Permissions: permissions,
+		ExpiresAt:   expiresAt,
 	}, nil
+}
+
+// Helper method to get user by username or email
+func (s *AuthService) getUserByCredential(credential string) (*model.User, error) {
+	// Try username first
+	user, err := s.userRepo.GetByUsername(credential)
+	if err != nil {
+		// Try email if username fails
+		user, err = s.userRepo.GetByEmail(credential)
+		if err != nil {
+			return nil, errors.New("user not found with credential: " + credential)
+		}
+	}
+	return user, nil
+}
+
+// Helper method to get user role and permissions
+func (s *AuthService) getUserRoleAndPermissions(roleID string) (*model.Role, []model.Permission, error) {
+	db := s.userRepo.GetDB()
+	if db == nil {
+		return nil, nil, errors.New("database connection not available")
+	}
+
+	// Get role
+	var role model.Role
+	roleQuery := `SELECT id, name, description, created_at FROM roles WHERE id = $1`
+	err := db.QueryRow(roleQuery, roleID).Scan(&role.ID, &role.Name, &role.Description, &role.CreatedAt)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Get permissions
+	permissionsQuery := `
+		SELECT p.id, p.name, p.resource, p.action, p.description
+		FROM permissions p
+		JOIN role_permissions rp ON p.id = rp.permission_id
+		WHERE rp.role_id = $1
+	`
+	
+	rows, err := db.Query(permissionsQuery, roleID)
+	if err != nil {
+		return &role, nil, nil // Return role even if permissions fail
+	}
+	defer rows.Close()
+
+	var permissions []model.Permission
+	for rows.Next() {
+		var permission model.Permission
+		err := rows.Scan(&permission.ID, &permission.Name, &permission.Resource, &permission.Action, &permission.Description)
+		if err != nil {
+			continue
+		}
+		permissions = append(permissions, permission)
+	}
+
+	return &role, permissions, nil
+}
+
+func (s *AuthService) Register(req *RegisterRequest) (*model.User, error) {
+	// Check if username already exists
+	_, err := s.userRepo.GetByUsername(req.Username)
+	if err == nil {
+		return nil, errors.New("username already exists")
+	}
+
+	// Check if email already exists
+	_, err = s.userRepo.GetByEmail(req.Email)
+	if err == nil {
+		return nil, errors.New("email already exists")
+	}
+
+	// Hash password
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get role ID based on role name
+	roleID, err := s.getRoleIDByName(req.Role)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create user
+	user := &model.User{
+		Username:  req.Username,
+		Email:     req.Email,
+		Password:  string(hashedPassword),
+		FullName:  req.FullName,
+		RoleID:    roleID,
+		IsActive:  true,
+	}
+
+	err = s.userRepo.Create(user)
+	if err != nil {
+		return nil, err
+	}
+
+	// Create additional profile based on role
+	switch req.Role {
+	case "student":
+		student := &model.Student{
+			UserID:       user.ID,
+			StudentID:    req.StudentID,
+			ProgramStudy: req.ProgramStudy,
+			AcademicYear: req.AcademicYear,
+		}
+		err = s.studentRepo.Create(student)
+		if err != nil {
+			// Rollback user creation if student creation fails
+			s.userRepo.Delete(user.ID)
+			return nil, err
+		}
+
+	case "lecturer":
+		lecturer := &model.Lecturer{
+			UserID:     user.ID,
+			LecturerID: req.LecturerID,
+			Department: req.Department,
+		}
+		err = s.lecturerRepo.Create(lecturer)
+		if err != nil {
+			// Rollback user creation if lecturer creation fails
+			s.userRepo.Delete(user.ID)
+			return nil, err
+		}
+	}
+
+	// Remove password from response
+	user.Password = ""
+	return user, nil
+}
+
+func (s *AuthService) generateToken(userID string, username string) (string, time.Time, error) {
+	expiresAt := time.Now().Add(24 * time.Hour)
+
+	claims := jwt.MapClaims{
+		"user_id":  userID,
+		"username": username,
+		"exp":      expiresAt.Unix(),
+		"iat":      time.Now().Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(s.jwtSecret))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	return tokenString, expiresAt, nil
+}
+
+func (s *AuthService) generateTokenWithRoleAndPermissions(userID string, username string, role *model.Role, permissions []model.Permission) (string, time.Time, error) {
+	expiresAt := time.Now().Add(24 * time.Hour)
+
+	// Create permission strings for JWT
+	var permissionStrings []string
+	for _, perm := range permissions {
+		permissionStrings = append(permissionStrings, perm.Resource+":"+perm.Action)
+	}
+
+	claims := jwt.MapClaims{
+		"user_id":     userID,
+		"username":    username,
+		"role":        role.Name,
+		"role_id":     role.ID,
+		"permissions": permissionStrings,
+		"exp":         expiresAt.Unix(),
+		"iat":         time.Now().Unix(),
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	tokenString, err := token.SignedString([]byte(s.jwtSecret))
+	if err != nil {
+		return "", time.Time{}, err
+	}
+
+	return tokenString, expiresAt, nil
+}
+
+func (s *AuthService) ValidateToken(tokenString string) (*jwt.MapClaims, error) {
+	token, err := jwt.Parse(tokenString, func(token *jwt.Token) (interface{}, error) {
+		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+			return nil, errors.New("invalid signing method")
+		}
+		return []byte(s.jwtSecret), nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok && token.Valid {
+		return &claims, nil
+	}
+
+	return nil, errors.New("invalid token")
+}
+
+func (s *AuthService) HandleLoginRequest(c *fiber.Ctx) error {
+	var req LoginRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid request body",
+		})
+	}
+
+	// Validate request
+	if req.Username == "" || req.Password == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Username and password are required",
+		})
+	}
+
+	// Process login
+	response, err := s.Login(&req)
+	if err != nil {
+		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    response,
+	})
+}
+
+func (s *AuthService) HandleRegisterRequest(c *fiber.Ctx) error {
+	var req RegisterRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid request body",
+		})
+	}
+
+	// Validate request
+	if req.Username == "" || req.Email == "" || req.Password == "" || req.FullName == "" || req.Role == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "All fields are required",
+		})
+	}
+
+	// Validate role-specific fields
+	if req.Role == "student" && (req.StudentID == "" || req.ProgramStudy == "" || req.AcademicYear == "") {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Student ID, program study, and academic year are required for students",
+		})
+	}
+
+	if req.Role == "lecturer" && (req.LecturerID == "" || req.Department == "") {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Lecturer ID and department are required for lecturers",
+		})
+	}
+
+	// Process registration
+	user, err := s.Register(&req)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"success": true,
+		"data":    user,
+	})
+}
+
+func (s *AuthService) getRoleIDByName(roleName string) (string, error) {
+	// Query PostgreSQL for role ID
+	db := s.userRepo.GetDB()
+	if db == nil {
+		return "", errors.New("database connection not available")
+	}
+	
+	var roleID string
+	query := "SELECT id FROM roles WHERE name = $1"
+	err := db.QueryRow(query, roleName).Scan(&roleID)
+	if err != nil {
+		return "", errors.New("role not found")
+	}
+	
+	return roleID, nil
 }

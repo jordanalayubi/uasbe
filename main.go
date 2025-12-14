@@ -11,6 +11,7 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/gofiber/fiber/v2/middleware/logger"
+	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/joho/godotenv"
 )
 
@@ -23,37 +24,58 @@ func main() {
 	// Connect to database
 	database.Connect()
 
-	// Auto migrate
-	database.Migrate()
+
+
+	// Get JWT secret from environment
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "your-secret-key-change-in-production"
+		log.Println("Warning: Using default JWT secret. Please set JWT_SECRET in production.")
+	}
 
 	// Initialize repositories
-	userRepo := repository.NewUserRepository(database.DB)
-	mahasiswaRepo := repository.NewMahasiswaRepository(database.DB)
-	matakuliahRepo := repository.NewMataKuliahRepository(database.DB)
-	nilaiRepo := repository.NewNilaiRepository(database.DB)
+	userRepo := repository.NewUserRepository()
+	studentRepo := repository.NewStudentRepository()
+	lecturerRepo := repository.NewLecturerRepository()
+	achievementRepo := repository.NewAchievementRepository()
 
 	// Initialize services
-	authService := service.NewAuthService(userRepo)
-	mahasiswaService := service.NewMahasiswaService(mahasiswaRepo, userRepo)
-	matakuliahService := service.NewMataKuliahService(matakuliahRepo)
-	nilaiService := service.NewNilaiService(nilaiRepo, mahasiswaRepo, matakuliahRepo)
+	authService := service.NewAuthService(userRepo, studentRepo, lecturerRepo, jwtSecret)
+	achievementService := service.NewAchievementService(achievementRepo, studentRepo, lecturerRepo)
 
 	// Create Fiber app
 	app := fiber.New(fiber.Config{
-		AppName: "UAS Mahasiswa API v1.0",
+		AppName: "UAS Achievement System API v1.0",
+		BodyLimit: 10 * 1024 * 1024, // 10MB for file uploads
 	})
 
 	// Middleware
-	app.Use(cors.New())
+	app.Use(recover.New())
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+		AllowMethods: "GET, POST, PUT, DELETE",
+	}))
 	app.Use(logger.New())
+
+	// Static file serving for uploads
+	app.Static("/uploads", "./uploads")
 
 	// Routes
 	route.SetupAuthRoutes(app, authService)
-	route.SetupMahasiswaRoutes(app, mahasiswaService)
-	route.SetupMataKuliahRoutes(app, matakuliahService)
-	route.SetupNilaiRoutes(app, nilaiService)
+	route.SetupAchievementRoutes(app, achievementService, authService)
+	route.SetupAdminRoutes(app, authService)
+	route.SetupTestRoutes(app, authService)
 
 	// Health check
+	app.Get("/", func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{
+			"status":  "ok",
+			"message": "UAS Achievement System API is running",
+			"version": "1.0",
+		})
+	})
+
 	app.Get("/health", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{
 			"status":  "ok",
@@ -61,10 +83,13 @@ func main() {
 		})
 	})
 
+	// Graceful shutdown
+	defer database.Disconnect()
+
 	// Start server
 	port := os.Getenv("APP_PORT")
 	if port == "" {
-		port = "8080"
+		port = "3000"
 	}
 
 	log.Printf("Server running on port %s", port)
