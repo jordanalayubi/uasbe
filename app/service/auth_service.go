@@ -298,28 +298,118 @@ func (s *AuthService) LoginRequest(c *fiber.Ctx) error {
 	var req LoginRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": "Invalid request body",
+			"message": "Please provide valid JSON data",
+			"code": "INVALID_REQUEST_BODY",
 		})
 	}
 
 	// Validate request
 	if req.Username == "" || req.Password == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Username and password are required",
+			"success": false,
+			"error": "Validation failed",
+			"message": "Username and password are required",
+			"code": "MISSING_CREDENTIALS",
+			"details": fiber.Map{
+				"username": req.Username == "",
+				"password": req.Password == "",
+			},
 		})
 	}
 
 	// Process login
 	response, err := s.Login(&req)
 	if err != nil {
+		// Enhanced error responses
+		var errorCode string
+		var message string
+		
+		switch err.Error() {
+		case "invalid credentials":
+			errorCode = "INVALID_CREDENTIALS"
+			message = "Username/email or password is incorrect"
+		case "account is deactivated":
+			errorCode = "ACCOUNT_DEACTIVATED"
+			message = "Your account has been deactivated. Please contact administrator"
+		default:
+			errorCode = "LOGIN_FAILED"
+			message = "Login failed. Please try again"
+		}
+		
 		return c.Status(fiber.StatusUnauthorized).JSON(fiber.Map{
+			"success": false,
 			"error": err.Error(),
+			"message": message,
+			"code": errorCode,
+			"timestamp": time.Now(),
 		})
 	}
 
+	// Get additional user profile info
+	var profileInfo fiber.Map
+	if response.Role.Name == "student" {
+		student, err := s.studentRepo.GetByUserID(response.User.ID)
+		if err == nil {
+			profileInfo = fiber.Map{
+				"type": "student",
+				"student_id": student.StudentID,
+				"program_study": student.ProgramStudy,
+				"academic_year": student.AcademicYear,
+				"advisor_id": student.AdvisorID,
+			}
+		}
+	} else if response.Role.Name == "lecturer" {
+		lecturer, err := s.lecturerRepo.GetByUserID(response.User.ID)
+		if err == nil {
+			profileInfo = fiber.Map{
+				"type": "lecturer",
+				"lecturer_id": lecturer.LecturerID,
+				"department": lecturer.Department,
+			}
+		}
+	} else {
+		profileInfo = fiber.Map{
+			"type": "admin",
+		}
+	}
+
+	// Enhanced success response
 	return c.JSON(fiber.Map{
 		"success": true,
-		"data":    response,
+		"message": "Login successful",
+		"code": "LOGIN_SUCCESS",
+		"data": fiber.Map{
+			"token": response.Token,
+			"expires_at": response.ExpiresAt,
+			"expires_in_seconds": int(time.Until(response.ExpiresAt).Seconds()),
+			"user": fiber.Map{
+				"id": response.User.ID,
+				"username": response.User.Username,
+				"email": response.User.Email,
+				"full_name": response.User.FullName,
+				"is_active": response.User.IsActive,
+				"created_at": response.User.CreatedAt,
+			},
+			"role": fiber.Map{
+				"id": response.Role.ID,
+				"name": response.Role.Name,
+				"description": response.Role.Description,
+			},
+			"permissions": response.Permissions,
+			"profile": profileInfo,
+		},
+		"session_info": fiber.Map{
+			"login_time": time.Now(),
+			"ip_address": c.IP(),
+			"user_agent": c.Get("User-Agent"),
+		},
+		"next_steps": []string{
+			"Use the token in Authorization header for subsequent requests",
+			"Token format: Bearer <token>",
+			"Token expires at: " + response.ExpiresAt.Format("2006-01-02 15:04:05"),
+		},
 	})
 }
 

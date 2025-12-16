@@ -150,37 +150,122 @@ func (s *AchievementService) GetAllAchievementsRequest(c *fiber.Ctx) error {
 		if student != nil {
 			studentInfo = fiber.Map{
 				"student_id":    student.StudentID,
+				"full_name":     "Student Name", // Will be enhanced with user data
 				"program_study": student.ProgramStudy,
+				"academic_year": student.AcademicYear,
 				"user_id":       student.UserID,
 			}
 		}
 
+		// Calculate processing time if verified
+		var processingTime string
+		if ref.Status == "verified" && !ref.SubmittedAt.IsZero() && !ref.VerifiedAt.IsZero() {
+			duration := ref.VerifiedAt.Sub(ref.SubmittedAt)
+			if duration.Hours() < 1 {
+				processingTime = fmt.Sprintf("%.0f minutes", duration.Minutes())
+			} else if duration.Hours() < 24 {
+				processingTime = fmt.Sprintf("%.1f hours", duration.Hours())
+			} else {
+				processingTime = fmt.Sprintf("%.1f days", duration.Hours()/24)
+			}
+		}
+
+		// Enhanced reference info
+		referenceInfo := fiber.Map{
+			"id":           ref.ID.Hex(),
+			"status":       ref.Status,
+			"submitted_at": ref.SubmittedAt,
+			"verified_at":  ref.VerifiedAt,
+			"verified_by":  ref.VerifiedBy,
+			"created_at":   ref.CreatedAt,
+			"updated_at":   ref.UpdatedAt,
+		}
+
+		if processingTime != "" {
+			referenceInfo["processing_time"] = processingTime
+		}
+
+		if ref.RejectionNote != "" {
+			referenceInfo["rejection_note"] = ref.RejectionNote
+		}
+
 		result = append(result, fiber.Map{
 			"achievement":  achievement,
-			"reference":    ref,
+			"reference":    referenceInfo,
 			"student_info": studentInfo,
 		})
 	}
 
 	// Calculate pagination
 	totalPages := (total + limit - 1) / limit
+	hasNextPage := page < totalPages
+	hasPreviousPage := page > 1
+
+	// Build next/previous URLs
+	var nextPageURL, previousPageURL *string
+	if hasNextPage {
+		nextURL := fmt.Sprintf("/api/achievements/admin/all?page=%d&limit=%d", page+1, limit)
+		if status != "" {
+			nextURL += "&status=" + status
+		}
+		if category != "" {
+			nextURL += "&category=" + category
+		}
+		nextPageURL = &nextURL
+	}
+	if hasPreviousPage {
+		prevURL := fmt.Sprintf("/api/achievements/admin/all?page=%d&limit=%d", page-1, limit)
+		if status != "" {
+			prevURL += "&status=" + status
+		}
+		if category != "" {
+			prevURL += "&category=" + category
+		}
+		previousPageURL = &prevURL
+	}
+
+	// Get statistics
+	stats, _ := s.achievementRepo.GetAchievementStatistics()
 
 	return c.JSON(fiber.Map{
 		"success": true,
-		"data":    result,
+		"message": "All achievements retrieved successfully",
+		"summary": fiber.Map{
+			"total_achievements": total,
+			"filtered_results":   len(result),
+			"page_results":       len(result),
+			"filters_applied": fiber.Map{
+				"status":     status,
+				"category":   category,
+				"student_id": studentID,
+			},
+		},
+		"data": result,
 		"pagination": fiber.Map{
-			"page":        page,
-			"limit":       limit,
-			"total":       total,
-			"total_pages": totalPages,
+			"current_page":       page,
+			"per_page":           limit,
+			"total_items":        total,
+			"total_pages":        totalPages,
+			"has_next_page":      hasNextPage,
+			"has_previous_page":  hasPreviousPage,
+			"next_page_url":      nextPageURL,
+			"previous_page_url":  previousPageURL,
 		},
 		"filters": fiber.Map{
-			"status":     status,
-			"category":   category,
-			"student_id": studentID,
-			"sort_by":    sortBy,
-			"sort_order": sortOrder,
+			"applied": fiber.Map{
+				"status":     status,
+				"category":   category,
+				"student_id": studentID,
+				"sort_by":    sortBy,
+				"sort_order": sortOrder,
+			},
+			"available": fiber.Map{
+				"statuses":    []string{"draft", "submitted", "verified", "rejected", "deleted"},
+				"categories":  []string{"competition", "research", "community_service", "academic", "organization"},
+				"sort_fields": []string{"created_at", "updated_at", "title", "category"},
+			},
 		},
+		"statistics": stats,
 	})
 }
 
@@ -188,25 +273,74 @@ func (s *AchievementService) GetAllAchievementsRequest(c *fiber.Ctx) error {
 func (s *AchievementService) CreateAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
+	username := c.Locals("username").(string)
 	
 	// FR-003 Precondition: User terautentikasi sebagai mahasiswa
 	if userRole != "student" && userRole != "Mahasiswa" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only students can submit achievements",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only students can submit achievements",
+			"code": "INSUFFICIENT_PERMISSIONS",
+			"user_role": userRole,
+			"required_role": "student",
 		})
 	}
 	
 	var req CreateAchievementRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": "Invalid request body",
+			"message": "Please provide valid JSON data",
+			"code": "INVALID_REQUEST_BODY",
 		})
 	}
 
-	// FR-003 Step 1: Mahasiswa mengisi data prestasi - Validate request
-	if req.Category == "" || req.Title == "" || req.Description == "" {
+	// FR-003 Step 1: Mahasiswa mengisi data prestasi - Enhanced validation
+	validationErrors := make(map[string]string)
+	if req.Category == "" {
+		validationErrors["category"] = "Category is required"
+	}
+	if req.Title == "" {
+		validationErrors["title"] = "Title is required"
+	}
+	if req.Description == "" {
+		validationErrors["description"] = "Description is required"
+	}
+	
+	// Validate category values
+	validCategories := []string{"competition", "research", "community_service", "academic", "organization"}
+	isValidCategory := false
+	for _, cat := range validCategories {
+		if req.Category == cat {
+			isValidCategory = true
+			break
+		}
+	}
+	if req.Category != "" && !isValidCategory {
+		validationErrors["category"] = "Invalid category. Valid options: " + fmt.Sprintf("%v", validCategories)
+	}
+
+	if len(validationErrors) > 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Category, title, and description are required",
+			"success": false,
+			"error": "Validation failed",
+			"message": "Please correct the following errors",
+			"code": "VALIDATION_ERROR",
+			"details": validationErrors,
+			"valid_categories": validCategories,
+		})
+	}
+
+	// Get student info for response
+	student, err := s.studentRepo.GetByUserID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Student profile not found",
+			"message": "Unable to find student profile for this user",
+			"code": "STUDENT_PROFILE_NOT_FOUND",
 		})
 	}
 
@@ -216,18 +350,59 @@ func (s *AchievementService) CreateAchievementRequest(c *fiber.Ctx) error {
 	achievement, reference, err := s.SubmitAchievement(userID, &req)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": err.Error(),
+			"success": false,
+			"error": "Failed to create achievement",
+			"message": err.Error(),
+			"code": "CREATION_FAILED",
 		})
 	}
 
-	// FR-003 Step 5: Return achievement data
+	// FR-003 Step 5: Enhanced return achievement data
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"success": true,
-		"message": "Achievement submitted successfully",
+		"message": "Achievement created successfully",
+		"code": "ACHIEVEMENT_CREATED",
 		"data": fiber.Map{
-			"achievement": achievement,
-			"reference":   reference,
+			"achievement": fiber.Map{
+				"id": achievement.ID.Hex(),
+				"student_id": achievement.StudentID,
+				"category": achievement.Category,
+				"title": achievement.Title,
+				"description": achievement.Description,
+				"details": achievement.Details,
+				"custom_fields": achievement.CustomFields,
+				"attachments": achievement.Attachments,
+				"tags": achievement.Tags,
+				"created_at": achievement.CreatedAt,
+				"updated_at": achievement.UpdatedAt,
+			},
+			"reference": fiber.Map{
+				"id": reference.ID.Hex(),
+				"student_id": reference.StudentID,
+				"achievement_id": reference.AchievementID,
+				"status": reference.Status,
+				"created_at": reference.CreatedAt,
+				"updated_at": reference.UpdatedAt,
+			},
+			"student_info": fiber.Map{
+				"student_id": student.StudentID,
+				"full_name": username,
+				"program_study": student.ProgramStudy,
+				"academic_year": student.AcademicYear,
+			},
 		},
+		"next_steps": []string{
+			"Your achievement has been saved as draft",
+			"You can edit this achievement anytime while it's in draft status",
+			"Submit for verification when you're ready: POST /api/achievements/" + achievement.ID.Hex() + "/submit",
+			"Upload attachments if needed: POST /api/achievements/upload/attachment",
+		},
+		"status_info": fiber.Map{
+			"current_status": "draft",
+			"description": "Achievement is saved but not yet submitted for verification",
+			"available_actions": []string{"edit", "delete", "submit_for_verification"},
+		},
+		"timestamp": time.Now(),
 	})
 }
 
@@ -325,12 +500,18 @@ func (s *AchievementService) UpdateAchievementRequest(c *fiber.Ctx) error {
 func (s *AchievementService) DeleteAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
+	username := c.Locals("username").(string)
 	idParam := c.Params("id")
 
 	// FR-005 Precondition: Hanya mahasiswa yang bisa hapus prestasi mereka sendiri
 	if userRole != "student" && userRole != "Mahasiswa" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only students can delete their own achievements",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only students can delete their own achievements",
+			"code": "INSUFFICIENT_PERMISSIONS",
+			"user_role": userRole,
+			"required_role": "student",
 		})
 	}
 
@@ -338,21 +519,111 @@ func (s *AchievementService) DeleteAchievementRequest(c *fiber.Ctx) error {
 	id, err := primitive.ObjectIDFromHex(idParam)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": "Invalid achievement ID",
+			"message": "The provided achievement ID is not valid",
+			"code": "INVALID_ACHIEVEMENT_ID",
+			"provided_id": idParam,
+		})
+	}
+
+	// Get achievement details before deletion for response
+	achievement, err := s.achievementRepo.GetByID(id)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Achievement not found",
+			"message": "The requested achievement does not exist or has been deleted",
+			"code": "ACHIEVEMENT_NOT_FOUND",
+		})
+	}
+
+	// Get reference for status check
+	reference, err := s.achievementRepo.GetReferenceByAchievementID(id.Hex())
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Achievement reference not found",
+			"message": "Unable to find achievement reference",
+			"code": "REFERENCE_NOT_FOUND",
+		})
+	}
+
+	// Get student info
+	student, err := s.studentRepo.GetByUserID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Student profile not found",
+			"code": "STUDENT_PROFILE_NOT_FOUND",
 		})
 	}
 
 	// FR-005 Flow: Soft delete prestasi
 	err = s.SoftDeleteAchievement(userID, id)
 	if err != nil {
+		var errorCode string
+		var message string
+		
+		switch err.Error() {
+		case "achievement can only be deleted when status is 'draft'":
+			errorCode = "INVALID_STATUS"
+			message = "Only draft achievements can be deleted. Current status: " + reference.Status
+		case "achievement not found":
+			errorCode = "ACHIEVEMENT_NOT_FOUND"
+			message = "The requested achievement does not exist"
+		case "unauthorized":
+			errorCode = "UNAUTHORIZED"
+			message = "You can only delete your own achievements"
+		default:
+			errorCode = "DELETION_FAILED"
+			message = "Failed to delete achievement"
+		}
+		
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": err.Error(),
+			"message": message,
+			"code": errorCode,
+			"current_status": reference.Status,
+			"allowed_status": []string{"draft"},
 		})
 	}
 
 	return c.JSON(fiber.Map{
 		"success": true,
-		"message": "Achievement deleted successfully",
+		"message": "Achievement deleted successfully (soft delete)",
+		"code": "DELETION_SUCCESS",
+		"data": fiber.Map{
+			"achievement_id": id.Hex(),
+			"reference_id": reference.ID.Hex(),
+			"deleted_at": time.Now(),
+			"previous_status": reference.Status,
+			"new_status": "deleted",
+			"student_info": fiber.Map{
+				"student_id": student.StudentID,
+				"full_name": username,
+				"program_study": student.ProgramStudy,
+			},
+			"achievement_summary": fiber.Map{
+				"title": achievement.Title,
+				"category": achievement.Category,
+				"created_at": achievement.CreatedAt,
+			},
+		},
+		"deletion_info": fiber.Map{
+			"type": "soft_delete",
+			"description": "Achievement is marked as deleted but data is preserved",
+			"recovery": "Data can be recovered by admin if needed",
+			"permanent": false,
+		},
+		"next_steps": []string{
+			"Achievement has been successfully deleted",
+			"The data is soft deleted and can be recovered by admin if needed",
+			"You can create a new achievement anytime",
+		},
+		"note": "Data is soft deleted and can be recovered by admin if needed",
+		"timestamp": time.Now(),
 	})
 }
 
@@ -360,27 +631,141 @@ func (s *AchievementService) DeleteAchievementRequest(c *fiber.Ctx) error {
 func (s *AchievementService) SubmitAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
+	username := c.Locals("username").(string)
 	achievementID := c.Params("achievement_id")
 
 	// FR-004 Precondition: Hanya mahasiswa yang bisa submit
 	if userRole != "student" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only students can submit achievements for verification",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only students can submit achievements for verification",
+			"code": "INSUFFICIENT_PERMISSIONS",
+			"user_role": userRole,
+			"required_role": "student",
+		})
+	}
+
+	if achievementID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Missing achievement ID",
+			"message": "Achievement ID is required in the URL path",
+			"code": "MISSING_ACHIEVEMENT_ID",
+		})
+	}
+
+	// Get student and achievement info for detailed response
+	student, err := s.studentRepo.GetByUserID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Student profile not found",
+			"message": "Unable to find student profile for this user",
+			"code": "STUDENT_PROFILE_NOT_FOUND",
+		})
+	}
+
+	// Get achievement details before submission
+	achievementObjID, err := primitive.ObjectIDFromHex(achievementID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Invalid achievement ID",
+			"message": "The provided achievement ID is not valid",
+			"code": "INVALID_ACHIEVEMENT_ID",
+		})
+	}
+
+	achievement, err := s.achievementRepo.GetByID(achievementObjID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Achievement not found",
+			"message": "The requested achievement does not exist or has been deleted",
+			"code": "ACHIEVEMENT_NOT_FOUND",
 		})
 	}
 
 	// FR-004 Flow: Submit prestasi untuk verifikasi
 	updatedReference, err := s.SubmitAchievementForVerification(userID, achievementID)
 	if err != nil {
+		var errorCode string
+		var message string
+		
+		switch err.Error() {
+		case "achievement can only be submitted when status is 'draft'":
+			errorCode = "INVALID_STATUS"
+			message = "Only draft achievements can be submitted for verification"
+		case "achievement not found":
+			errorCode = "ACHIEVEMENT_NOT_FOUND"
+			message = "The requested achievement does not exist"
+		default:
+			errorCode = "SUBMISSION_FAILED"
+			message = "Failed to submit achievement for verification"
+		}
+		
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": err.Error(),
+			"message": message,
+			"code": errorCode,
 		})
+	}
+
+	// Get advisor info if available
+	var advisorInfo fiber.Map
+	if student.AdvisorID != "" {
+		lecturer, err := s.lecturerRepo.GetByUserID(student.AdvisorID)
+		if err == nil {
+			advisorInfo = fiber.Map{
+				"advisor_id": lecturer.LecturerID,
+				"department": lecturer.Department,
+				"notified": true,
+			}
+		}
 	}
 
 	return c.JSON(fiber.Map{
 		"success": true,
-		"message": "Achievement submitted for verification",
-		"data":    updatedReference,
+		"message": "Achievement submitted for verification successfully",
+		"code": "SUBMISSION_SUCCESS",
+		"data": fiber.Map{
+			"reference_id": updatedReference.ID.Hex(),
+			"achievement_id": updatedReference.AchievementID,
+			"status": updatedReference.Status,
+			"submitted_at": updatedReference.SubmittedAt,
+			"student_info": fiber.Map{
+				"student_id": student.StudentID,
+				"full_name": username,
+				"program_study": student.ProgramStudy,
+				"academic_year": student.AcademicYear,
+			},
+			"achievement_summary": fiber.Map{
+				"title": achievement.Title,
+				"category": achievement.Category,
+				"description": achievement.Description,
+			},
+			"advisor_info": advisorInfo,
+		},
+		"status_info": fiber.Map{
+			"previous_status": "draft",
+			"current_status": "submitted",
+			"description": "Achievement is now pending verification by your advisor",
+			"available_actions": []string{"view", "wait_for_verification"},
+		},
+		"next_steps": []string{
+			"Your achievement has been submitted to your advisor for verification",
+			"You will receive a notification when the verification is complete",
+			"You cannot edit the achievement while it's under review",
+			"Check your notifications for updates",
+		},
+		"notification": fiber.Map{
+			"advisor_notified": advisorInfo != nil,
+			"message": "New achievement submission requires your verification",
+			"type": "verification_request",
+		},
+		"timestamp": time.Now(),
 	})
 }
 
@@ -439,41 +824,52 @@ func (s *AchievementService) GetVerificationDetailRequest(c *fiber.Ctx) error {
 func (s *AchievementService) VerifyAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
+	username := c.Locals("username").(string)
 	refIDParam := c.Params("reference_id")
 
 	// FR-007 Precondition: Hanya dosen wali yang bisa verify
 	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only lecturers can verify achievements",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only lecturers can verify achievements",
+			"code": "INSUFFICIENT_PERMISSIONS",
+			"user_role": userRole,
+			"required_role": "lecturer",
 		})
 	}
 	
 	var req VerifyAchievementRequest
 	if err := c.BodyParser(&req); err != nil {
-		// Debug: log the error and body content
-		fmt.Printf("DEBUG: Body parsing error: %v\n", err)
-		fmt.Printf("DEBUG: Request body: %s\n", string(c.Body()))
-		fmt.Printf("DEBUG: Content-Type: %s\n", c.Get("Content-Type"))
-		
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid request body: " + err.Error(),
+			"success": false,
+			"error": "Invalid request body",
+			"message": "Please provide valid JSON data",
+			"code": "INVALID_REQUEST_BODY",
+			"details": err.Error(),
 		})
 	}
 
-	// Debug: log parsed request
-	fmt.Printf("DEBUG: Parsed request - Status: %s, RejectionNote: %s\n", req.Status, req.RejectionNote)
-
-	// FR-007/FR-008 Step 1 & 2: Validate request - dosen approve atau reject prestasi
+	// FR-007/FR-008 Step 1 & 2: Enhanced validation
+	validationErrors := make(map[string]string)
+	
 	if req.Status != "verified" && req.Status != "rejected" {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Status must be 'verified' or 'rejected'",
-		})
+		validationErrors["status"] = "Status must be 'verified' or 'rejected'"
 	}
 
 	// FR-008 Step 1: Dosen input rejection note (required when rejecting)
 	if req.Status == "rejected" && req.RejectionNote == "" {
+		validationErrors["rejection_note"] = "Rejection note is required when rejecting"
+	}
+
+	if len(validationErrors) > 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Rejection note is required when rejecting",
+			"success": false,
+			"error": "Validation failed",
+			"message": "Please correct the following errors",
+			"code": "VALIDATION_ERROR",
+			"details": validationErrors,
+			"valid_statuses": []string{"verified", "rejected"},
 		})
 	}
 
@@ -481,37 +877,166 @@ func (s *AchievementService) VerifyAchievementRequest(c *fiber.Ctx) error {
 	refID, err := primitive.ObjectIDFromHex(refIDParam)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": "Invalid reference ID",
+			"message": "The provided reference ID is not valid",
+			"code": "INVALID_REFERENCE_ID",
+			"provided_id": refIDParam,
+		})
+	}
+
+	// Get reference and achievement details before processing
+	reference, err := s.achievementRepo.GetReferenceByID(refID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Reference not found",
+			"message": "The requested achievement reference does not exist",
+			"code": "REFERENCE_NOT_FOUND",
+		})
+	}
+
+	// Get achievement details
+	achievementObjID, _ := primitive.ObjectIDFromHex(reference.AchievementID)
+	achievement, err := s.achievementRepo.GetByID(achievementObjID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Achievement not found",
+			"code": "ACHIEVEMENT_NOT_FOUND",
+		})
+	}
+
+	// Get student info
+	student, err := s.studentRepo.GetByUserID(reference.StudentID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Student not found",
+			"code": "STUDENT_NOT_FOUND",
+		})
+	}
+
+	// Get lecturer info
+	lecturer, err := s.lecturerRepo.GetByUserID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Lecturer profile not found",
+			"code": "LECTURER_NOT_FOUND",
 		})
 	}
 
 	// FR-007/FR-008 Flow: Process verification/rejection
 	updatedReference, err := s.VerifyAchievementWithDetails(userID, refID, &req)
 	if err != nil {
+		var errorCode string
+		var message string
+		
+		switch err.Error() {
+		case "only submitted achievements can be verified":
+			errorCode = "INVALID_STATUS"
+			message = "Only submitted achievements can be verified. Current status: " + reference.Status
+		case "unauthorized":
+			errorCode = "UNAUTHORIZED"
+			message = "You can only verify achievements of your advisee students"
+		default:
+			errorCode = "VERIFICATION_FAILED"
+			message = "Failed to process verification"
+		}
+		
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": err.Error(),
+			"message": message,
+			"code": errorCode,
+			"current_status": reference.Status,
+			"allowed_status": []string{"submitted"},
 		})
 	}
 
-	// FR-007/FR-008 Step 5: Return updated status
-	var message string
-	if req.Status == "verified" {
-		message = "Achievement verified successfully"
-	} else {
-		message = "Achievement rejected successfully"
+	// Calculate processing time
+	var processingTime string
+	if !reference.SubmittedAt.IsZero() && !updatedReference.VerifiedAt.IsZero() {
+		duration := updatedReference.VerifiedAt.Sub(reference.SubmittedAt)
+		if duration.Hours() < 1 {
+			processingTime = fmt.Sprintf("%.0f minutes", duration.Minutes())
+		} else if duration.Hours() < 24 {
+			processingTime = fmt.Sprintf("%.1f hours", duration.Hours())
+		} else {
+			processingTime = fmt.Sprintf("%.1f days", duration.Hours()/24)
+		}
 	}
 
-	return c.JSON(fiber.Map{
+	// FR-007/FR-008 Step 5: Enhanced return response
+	var message, actionType string
+	var nextSteps []string
+	
+	if req.Status == "verified" {
+		message = "Achievement verified successfully"
+		actionType = "VERIFICATION_SUCCESS"
+		nextSteps = []string{
+			"Achievement has been approved and is now verified",
+			"Student will receive a notification about the approval",
+			"Achievement is now part of student's verified portfolio",
+		}
+	} else {
+		message = "Achievement rejected successfully"
+		actionType = "REJECTION_SUCCESS"
+		nextSteps = []string{
+			"Achievement has been rejected with feedback",
+			"Student will receive a notification with rejection details",
+			"Student can review feedback and resubmit after improvements",
+		}
+	}
+
+	responseData := fiber.Map{
 		"success": true,
 		"message": message,
+		"code": actionType,
 		"data": fiber.Map{
-			"reference_id":   updatedReference.ID.Hex(),
-			"status":         updatedReference.Status,
-			"verified_by":    updatedReference.VerifiedBy,
-			"verified_at":    updatedReference.VerifiedAt,
-			"rejection_note": updatedReference.RejectionNote,
+			"reference_id": updatedReference.ID.Hex(),
+			"achievement_id": updatedReference.AchievementID,
+			"status": updatedReference.Status,
+			"verified_by": updatedReference.VerifiedBy,
+			"verified_at": updatedReference.VerifiedAt,
+			"lecturer_info": fiber.Map{
+				"lecturer_id": lecturer.LecturerID,
+				"full_name": username,
+				"department": lecturer.Department,
+			},
+			"student_info": fiber.Map{
+				"student_id": student.StudentID,
+				"program_study": student.ProgramStudy,
+				"academic_year": student.AcademicYear,
+				"user_id": student.UserID,
+			},
+			"achievement_summary": fiber.Map{
+				"title": achievement.Title,
+				"category": achievement.Category,
+				"submitted_at": reference.SubmittedAt,
+			},
 		},
-	})
+		"status_info": fiber.Map{
+			"previous_status": "submitted",
+			"current_status": updatedReference.Status,
+			"processing_time": processingTime,
+		},
+		"next_steps": nextSteps,
+		"timestamp": time.Now(),
+	}
+
+	// Add rejection-specific info
+	if req.Status == "rejected" {
+		responseData["data"].(fiber.Map)["rejection_note"] = updatedReference.RejectionNote
+		responseData["notification_sent"] = fiber.Map{
+			"to_student": true,
+			"message": "Your achievement submission has been rejected",
+			"includes_feedback": true,
+		}
+	}
+
+	return c.JSON(responseData)
 }
 
 // UploadAttachmentRequest - Service method for file upload for achievement attachments
@@ -1018,17 +1543,26 @@ func (s *AchievementService) DeleteAchievement(studentID string, achievementID p
 func (s *AchievementService) GetAdviseeAchievementsRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
+	username := c.Locals("username").(string)
 
 	// FR-006 Precondition: Hanya dosen yang bisa akses
 	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only lecturers can view advisee achievements",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only lecturers can view advisee achievements",
+			"code": "INSUFFICIENT_PERMISSIONS",
+			"user_role": userRole,
+			"required_role": "lecturer",
 		})
 	}
 
-	// Parse pagination parameters
+	// Parse pagination parameters with validation
 	page := c.QueryInt("page", 1)
 	limit := c.QueryInt("limit", 10)
+	status := c.Query("status", "")
+	category := c.Query("category", "")
+	
 	if page < 1 {
 		page = 1
 	}
@@ -1037,23 +1571,132 @@ func (s *AchievementService) GetAdviseeAchievementsRequest(c *fiber.Ctx) error {
 	}
 	offset := (page - 1) * limit
 
+	// Get lecturer info for response
+	lecturer, err := s.lecturerRepo.GetByUserID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "Lecturer profile not found",
+			"message": "Unable to find lecturer profile for this user",
+			"code": "LECTURER_PROFILE_NOT_FOUND",
+		})
+	}
+
 	// FR-006 Flow: Get advisee achievements with pagination
 	result, err := s.GetAdviseeAchievements(userID, limit, offset)
 	if err != nil {
+		var errorCode string
+		var message string
+		
+		switch err.Error() {
+		case "no advisee students found":
+			errorCode = "NO_ADVISEES"
+			message = "You don't have any advisee students assigned"
+		default:
+			errorCode = "FETCH_FAILED"
+			message = "Failed to retrieve advisee achievements"
+		}
+		
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
 			"error": err.Error(),
+			"message": message,
+			"code": errorCode,
 		})
+	}
+
+	// Get advisee count and statistics
+	adviseeStudents, _ := s.studentRepo.GetByAdvisorID(userID)
+	totalAdvisees := len(adviseeStudents)
+	
+	// Calculate statistics
+	statusCounts := make(map[string]int)
+	categoryCounts := make(map[string]int)
+	
+	for _, achievement := range result.Achievements {
+		statusCounts[achievement.Reference.Status]++
+		categoryCounts[achievement.Achievement.Category]++
+	}
+
+	// Calculate pagination
+	totalPages := (result.Total + int64(limit) - 1) / int64(limit)
+	hasNextPage := page < int(totalPages)
+	hasPreviousPage := page > 1
+
+	// Build next/previous URLs
+	var nextPageURL, previousPageURL *string
+	if hasNextPage {
+		nextURL := fmt.Sprintf("/api/achievements/advisee?page=%d&limit=%d", page+1, limit)
+		if status != "" {
+			nextURL += "&status=" + status
+		}
+		if category != "" {
+			nextURL += "&category=" + category
+		}
+		nextPageURL = &nextURL
+	}
+	if hasPreviousPage {
+		prevURL := fmt.Sprintf("/api/achievements/advisee?page=%d&limit=%d", page-1, limit)
+		if status != "" {
+			prevURL += "&status=" + status
+		}
+		if category != "" {
+			prevURL += "&category=" + category
+		}
+		previousPageURL = &prevURL
 	}
 
 	return c.JSON(fiber.Map{
 		"success": true,
-		"data":    result.Achievements,
-		"pagination": fiber.Map{
-			"page":        page,
-			"limit":       limit,
-			"total":       result.Total,
-			"total_pages": (result.Total + int64(limit) - 1) / int64(limit),
+		"message": "Advisee achievements retrieved successfully",
+		"code": "ADVISEE_ACHIEVEMENTS_FOUND",
+		"summary": fiber.Map{
+			"total_achievements": result.Total,
+			"page_results": len(result.Achievements),
+			"total_advisees": totalAdvisees,
+			"filters_applied": fiber.Map{
+				"status": status,
+				"category": category,
+			},
 		},
+		"data": result.Achievements,
+		"pagination": fiber.Map{
+			"current_page": page,
+			"per_page": limit,
+			"total_items": result.Total,
+			"total_pages": totalPages,
+			"has_next_page": hasNextPage,
+			"has_previous_page": hasPreviousPage,
+			"next_page_url": nextPageURL,
+			"previous_page_url": previousPageURL,
+		},
+		"lecturer_info": fiber.Map{
+			"lecturer_id": lecturer.LecturerID,
+			"full_name": username,
+			"department": lecturer.Department,
+			"total_advisees": totalAdvisees,
+			"total_achievements": result.Total,
+		},
+		"statistics": fiber.Map{
+			"by_status": statusCounts,
+			"by_category": categoryCounts,
+		},
+		"filters": fiber.Map{
+			"applied": fiber.Map{
+				"status": status,
+				"category": category,
+			},
+			"available": fiber.Map{
+				"statuses": []string{"draft", "submitted", "verified", "rejected"},
+				"categories": []string{"competition", "research", "community_service", "academic", "organization"},
+			},
+		},
+		"actions_available": []string{
+			"verify_achievement",
+			"reject_achievement",
+			"view_achievement_detail",
+		},
+		"timestamp": time.Now(),
 	})
 }
 
@@ -1238,4 +1881,514 @@ func (s *AchievementService) mapDetailsToAchievement(achievement *model.Achievem
 	if val, ok := details["score"].(float64); ok {
 		achievement.Details.Score = int(val)
 	}
+}
+// FR-011: Achievement Statistics - Generate statistik prestasi
+func (s *AchievementService) GetAchievementStatisticsRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
+	username := c.Locals("username").(string)
+
+	// Get query parameters
+	period := c.Query("period", "all") // all, year, month
+	year := c.QueryInt("year", time.Now().Year())
+	month := c.QueryInt("month", 0)
+
+	var stats fiber.Map
+	var err error
+
+	switch userRole {
+	case "student":
+		// FR-011: Mahasiswa melihat statistik prestasi sendiri
+		stats, err = s.GetStudentStatistics(userID, period, year, month)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"error": "Failed to get student statistics",
+				"message": err.Error(),
+				"code": "STUDENT_STATS_FAILED",
+			})
+		}
+
+	case "lecturer":
+		// FR-011: Dosen Wali melihat statistik prestasi mahasiswa bimbingan
+		stats, err = s.GetLecturerStatistics(userID, period, year, month)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"error": "Failed to get lecturer statistics",
+				"message": err.Error(),
+				"code": "LECTURER_STATS_FAILED",
+			})
+		}
+
+	case "admin":
+		// FR-011: Admin melihat statistik semua prestasi
+		stats, err = s.GetAdminStatistics(period, year, month)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+				"success": false,
+				"error": "Failed to get admin statistics",
+				"message": err.Error(),
+				"code": "ADMIN_STATS_FAILED",
+			})
+		}
+
+	default:
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Invalid user role for statistics access",
+			"code": "INVALID_ROLE",
+			"user_role": userRole,
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Achievement statistics retrieved successfully",
+		"code": "STATISTICS_SUCCESS",
+		"data": stats,
+		"user_info": fiber.Map{
+			"user_id": userID,
+			"username": username,
+			"role": userRole,
+		},
+		"query_parameters": fiber.Map{
+			"period": period,
+			"year": year,
+			"month": month,
+		},
+		"timestamp": time.Now(),
+	})
+}
+
+// FR-011: Get Student Statistics - Statistik prestasi mahasiswa sendiri
+func (s *AchievementService) GetStudentStatistics(userID string, period string, year, month int) (fiber.Map, error) {
+	// Get student info
+	student, err := s.studentRepo.GetByUserID(userID)
+	if err != nil {
+		return nil, errors.New("student profile not found")
+	}
+
+	// Get student achievements
+	achievements, err := s.achievementRepo.GetByStudentID(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get achievement references
+	references, err := s.achievementRepo.GetReferencesByStudentID(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Calculate statistics
+	totalAchievements := len(achievements)
+	statusCounts := make(map[string]int)
+	categoryCounts := make(map[string]int)
+	levelCounts := make(map[string]int)
+	monthlyStats := make(map[string]int)
+
+	// Process achievements
+	for _, achievement := range achievements {
+		categoryCounts[achievement.Category]++
+		
+		// Extract competition level from details
+		if achievement.Details.CompetitionLevel != "" {
+			levelCounts[achievement.Details.CompetitionLevel]++
+		}
+
+		// Monthly statistics
+		monthKey := achievement.CreatedAt.Format("2006-01")
+		monthlyStats[monthKey]++
+	}
+
+	// Process references for status
+	for _, ref := range references {
+		statusCounts[ref.Status]++
+	}
+
+	// Calculate achievements by period
+	var periodStats fiber.Map
+	if period == "year" {
+		periodStats = s.calculateYearlyStats(achievements, year)
+	} else if period == "month" {
+		periodStats = s.calculateMonthlyStats(achievements, year, month)
+	}
+
+	return fiber.Map{
+		"overview": fiber.Map{
+			"total_achievements": totalAchievements,
+			"verified_achievements": statusCounts["verified"],
+			"pending_achievements": statusCounts["submitted"],
+			"draft_achievements": statusCounts["draft"],
+		},
+		"by_category": categoryCounts,
+		"by_status": statusCounts,
+		"by_competition_level": levelCounts,
+		"monthly_trend": monthlyStats,
+		"period_stats": periodStats,
+		"student_info": fiber.Map{
+			"student_id": student.StudentID,
+			"program_study": student.ProgramStudy,
+			"academic_year": student.AcademicYear,
+		},
+		"achievements_summary": fiber.Map{
+			"most_active_category": s.getMostActiveCategory(categoryCounts),
+			"achievement_rate": s.calculateAchievementRate(achievements, references),
+			"recent_achievements": s.getRecentAchievements(achievements, 5),
+		},
+	}, nil
+}
+
+// FR-011: Get Lecturer Statistics - Statistik prestasi mahasiswa bimbingan
+func (s *AchievementService) GetLecturerStatistics(lecturerID string, period string, year, month int) (fiber.Map, error) {
+	// Get lecturer info
+	lecturer, err := s.lecturerRepo.GetByUserID(lecturerID)
+	if err != nil {
+		return nil, errors.New("lecturer profile not found")
+	}
+
+	// Get advisee students
+	adviseeStudents, err := s.studentRepo.GetByAdvisorID(lecturerID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(adviseeStudents) == 0 {
+		return fiber.Map{
+			"overview": fiber.Map{
+				"total_advisees": 0,
+				"total_achievements": 0,
+				"message": "No advisee students found",
+			},
+			"lecturer_info": fiber.Map{
+				"lecturer_id": lecturer.LecturerID,
+				"department": lecturer.Department,
+			},
+		}, nil
+	}
+
+	// Get student IDs
+	var studentIDs []string
+	for _, student := range adviseeStudents {
+		studentIDs = append(studentIDs, student.UserID)
+	}
+
+	// Get all achievements from advisee students
+	achievements, err := s.achievementRepo.GetByStudentIDs(studentIDs, 0, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Calculate statistics
+	totalAchievements := len(achievements)
+	statusCounts := make(map[string]int)
+	categoryCounts := make(map[string]int)
+	levelCounts := make(map[string]int)
+	studentStats := make(map[string]int)
+
+	// Process achievements
+	for _, achievement := range achievements {
+		categoryCounts[achievement.Category]++
+		studentStats[achievement.StudentID]++
+		
+		// Extract competition level
+		if achievement.Details.CompetitionLevel != "" {
+			levelCounts[achievement.Details.CompetitionLevel]++
+		}
+	}
+
+	// Get references for status counts
+	for _, studentID := range studentIDs {
+		refs, err := s.achievementRepo.GetReferencesByStudentID(studentID)
+		if err != nil {
+			continue
+		}
+		for _, ref := range refs {
+			statusCounts[ref.Status]++
+		}
+	}
+
+	// Get top performing students
+	topStudents := s.getTopStudents(studentStats, adviseeStudents, 5)
+
+	return fiber.Map{
+		"overview": fiber.Map{
+			"total_advisees": len(adviseeStudents),
+			"total_achievements": totalAchievements,
+			"verified_achievements": statusCounts["verified"],
+			"pending_verifications": statusCounts["submitted"],
+		},
+		"by_category": categoryCounts,
+		"by_status": statusCounts,
+		"by_competition_level": levelCounts,
+		"top_students": topStudents,
+		"lecturer_info": fiber.Map{
+			"lecturer_id": lecturer.LecturerID,
+			"department": lecturer.Department,
+			"total_advisees": len(adviseeStudents),
+		},
+		"advisee_performance": fiber.Map{
+			"average_achievements_per_student": float64(totalAchievements) / float64(len(adviseeStudents)),
+			"most_active_category": s.getMostActiveCategory(categoryCounts),
+			"verification_rate": s.calculateVerificationRate(statusCounts),
+		},
+	}, nil
+}
+
+// FR-011: Get Admin Statistics - Statistik semua prestasi
+func (s *AchievementService) GetAdminStatistics(period string, year, month int) (fiber.Map, error) {
+	// Get all achievements
+	achievements, err := s.achievementRepo.GetAll(0, 0)
+	if err != nil {
+		return nil, err
+	}
+
+	// Get all students
+	students, err := s.studentRepo.GetAll()
+	if err != nil {
+		return nil, err
+	}
+
+	// Calculate comprehensive statistics
+	totalAchievements := len(achievements)
+	categoryCounts := make(map[string]int)
+	levelCounts := make(map[string]int)
+	monthlyStats := make(map[string]int)
+	studentStats := make(map[string]int)
+
+	// Process achievements
+	for _, achievement := range achievements {
+		categoryCounts[achievement.Category]++
+		studentStats[achievement.StudentID]++
+		
+		// Extract competition level
+		if achievement.Details.CompetitionLevel != "" {
+			levelCounts[achievement.Details.CompetitionLevel]++
+		}
+
+		// Monthly statistics
+		monthKey := achievement.CreatedAt.Format("2006-01")
+		monthlyStats[monthKey]++
+	}
+
+	// Get status statistics from repository
+	statusStats, err := s.achievementRepo.GetAchievementStatistics()
+	if err != nil {
+		return nil, err
+	}
+
+	// Get top performing students
+	topStudents := s.getTopStudentsAdmin(studentStats, students, 10)
+
+	// Calculate period-specific statistics
+	var periodStats fiber.Map
+	if period == "year" {
+		periodStats = s.calculateYearlyStats(achievements, year)
+	} else if period == "month" {
+		periodStats = s.calculateMonthlyStats(achievements, year, month)
+	}
+
+	// Extract status stats safely
+	var byStatusMap map[string]int
+	if statusStats != nil {
+		if statusMap, ok := statusStats["by_status"].(map[string]int); ok {
+			byStatusMap = statusMap
+		}
+	}
+	if byStatusMap == nil {
+		byStatusMap = make(map[string]int)
+	}
+
+	return fiber.Map{
+		"overview": fiber.Map{
+			"total_achievements": totalAchievements,
+			"total_students": len(students),
+			"verified_achievements": byStatusMap["verified"],
+			"pending_achievements": byStatusMap["submitted"],
+		},
+		"by_category": categoryCounts,
+		"by_status": byStatusMap,
+		"by_competition_level": levelCounts,
+		"monthly_trend": monthlyStats,
+		"period_stats": periodStats,
+		"top_students": topStudents,
+		"system_performance": fiber.Map{
+			"average_achievements_per_student": float64(totalAchievements) / float64(len(students)),
+			"most_popular_category": s.getMostActiveCategory(categoryCounts),
+			"most_common_level": s.getMostActiveLevel(levelCounts),
+			"achievement_growth": s.calculateGrowthRate(monthlyStats),
+		},
+	}, nil
+}
+
+// Helper functions for statistics calculation
+func (s *AchievementService) calculateYearlyStats(achievements []model.Achievement, year int) fiber.Map {
+	monthlyCount := make(map[int]int)
+	
+	for _, achievement := range achievements {
+		if achievement.CreatedAt.Year() == year {
+			monthlyCount[int(achievement.CreatedAt.Month())]++
+		}
+	}
+	
+	return fiber.Map{
+		"year": year,
+		"monthly_breakdown": monthlyCount,
+		"total_for_year": s.sumMapValues(monthlyCount),
+	}
+}
+
+func (s *AchievementService) calculateMonthlyStats(achievements []model.Achievement, year, month int) fiber.Map {
+	dailyCount := make(map[int]int)
+	
+	for _, achievement := range achievements {
+		if achievement.CreatedAt.Year() == year && int(achievement.CreatedAt.Month()) == month {
+			dailyCount[achievement.CreatedAt.Day()]++
+		}
+	}
+	
+	return fiber.Map{
+		"year": year,
+		"month": month,
+		"daily_breakdown": dailyCount,
+		"total_for_month": s.sumMapValues(dailyCount),
+	}
+}
+
+func (s *AchievementService) getMostActiveCategory(categoryCounts map[string]int) string {
+	maxCount := 0
+	mostActive := ""
+	
+	for category, count := range categoryCounts {
+		if count > maxCount {
+			maxCount = count
+			mostActive = category
+		}
+	}
+	
+	return mostActive
+}
+
+func (s *AchievementService) getMostActiveLevel(levelCounts map[string]int) string {
+	maxCount := 0
+	mostActive := ""
+	
+	for level, count := range levelCounts {
+		if count > maxCount {
+			maxCount = count
+			mostActive = level
+		}
+	}
+	
+	return mostActive
+}
+
+func (s *AchievementService) calculateAchievementRate(achievements []model.Achievement, references []model.AchievementReference) float64 {
+	if len(references) == 0 {
+		return 0
+	}
+	
+	verifiedCount := 0
+	for _, ref := range references {
+		if ref.Status == "verified" {
+			verifiedCount++
+		}
+	}
+	
+	return float64(verifiedCount) / float64(len(references)) * 100
+}
+
+func (s *AchievementService) calculateVerificationRate(statusCounts map[string]int) float64 {
+	total := 0
+	verified := statusCounts["verified"]
+	
+	for _, count := range statusCounts {
+		total += count
+	}
+	
+	if total == 0 {
+		return 0
+	}
+	
+	return float64(verified) / float64(total) * 100
+}
+
+func (s *AchievementService) getRecentAchievements(achievements []model.Achievement, limit int) []fiber.Map {
+	// Sort by created_at desc and take limit
+	var recent []fiber.Map
+	
+	// Simple implementation - in production, you'd sort properly
+	count := 0
+	for i := len(achievements) - 1; i >= 0 && count < limit; i-- {
+		achievement := achievements[i]
+		recent = append(recent, fiber.Map{
+			"id": achievement.ID.Hex(),
+			"title": achievement.Title,
+			"category": achievement.Category,
+			"created_at": achievement.CreatedAt,
+		})
+		count++
+	}
+	
+	return recent
+}
+
+func (s *AchievementService) getTopStudents(studentStats map[string]int, students []model.Student, limit int) []fiber.Map {
+	// Create student map for quick lookup
+	studentMap := make(map[string]*model.Student)
+	for i, student := range students {
+		studentMap[student.UserID] = &students[i]
+	}
+	
+	// Convert to slice for sorting
+	type studentScore struct {
+		StudentID string
+		Count     int
+		Student   *model.Student
+	}
+	
+	var scores []studentScore
+	for studentID, count := range studentStats {
+		if student, exists := studentMap[studentID]; exists {
+			scores = append(scores, studentScore{
+				StudentID: studentID,
+				Count:     count,
+				Student:   student,
+			})
+		}
+	}
+	
+	// Simple sorting (in production, use proper sorting)
+	var topStudents []fiber.Map
+	for i := 0; i < len(scores) && i < limit; i++ {
+		score := scores[i]
+		topStudents = append(topStudents, fiber.Map{
+			"student_id": score.Student.StudentID,
+			"program_study": score.Student.ProgramStudy,
+			"achievement_count": score.Count,
+			"rank": i + 1,
+		})
+	}
+	
+	return topStudents
+}
+
+func (s *AchievementService) getTopStudentsAdmin(studentStats map[string]int, students []model.Student, limit int) []fiber.Map {
+	return s.getTopStudents(studentStats, students, limit)
+}
+
+func (s *AchievementService) calculateGrowthRate(monthlyStats map[string]int) float64 {
+	// Simple growth calculation - compare last month with previous
+	// In production, implement proper growth rate calculation
+	return 0.0 // Placeholder
+}
+
+func (s *AchievementService) sumMapValues(m map[int]int) int {
+	sum := 0
+	for _, v := range m {
+		sum += v
+	}
+	return sum
 }

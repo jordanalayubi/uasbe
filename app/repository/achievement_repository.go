@@ -6,6 +6,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/gofiber/fiber/v2"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -409,4 +410,85 @@ func (r *AchievementRepository) GetAchievementsByIDsWithFilters(achievementIDs [
 	
 	err = cursor.All(context.Background(), &achievements)
 	return achievements, err
+}
+// FR-010: Get achievement statistics for admin dashboard
+func (r *AchievementRepository) GetAchievementStatistics() (fiber.Map, error) {
+	// Get status statistics from references
+	statusPipeline := []bson.M{
+		{
+			"$group": bson.M{
+				"_id":   "$status",
+				"count": bson.M{"$sum": 1},
+			},
+		},
+	}
+	
+	statusCursor, err := r.referenceCollection.Aggregate(context.Background(), statusPipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer statusCursor.Close(context.Background())
+	
+	statusStats := make(map[string]int)
+	for statusCursor.Next(context.Background()) {
+		var result struct {
+			ID    string `bson:"_id"`
+			Count int    `bson:"count"`
+		}
+		if err := statusCursor.Decode(&result); err != nil {
+			continue
+		}
+		statusStats[result.ID] = result.Count
+	}
+	
+	// Get category statistics from achievements
+	categoryPipeline := []bson.M{
+		{
+			"$match": bson.M{
+				"deleted_at": bson.M{"$exists": false},
+			},
+		},
+		{
+			"$group": bson.M{
+				"_id":   "$category",
+				"count": bson.M{"$sum": 1},
+			},
+		},
+	}
+	
+	categoryCursor, err := r.collection.Aggregate(context.Background(), categoryPipeline)
+	if err != nil {
+		return nil, err
+	}
+	defer categoryCursor.Close(context.Background())
+	
+	categoryStats := make(map[string]int)
+	for categoryCursor.Next(context.Background()) {
+		var result struct {
+			ID    string `bson:"_id"`
+			Count int    `bson:"count"`
+		}
+		if err := categoryCursor.Decode(&result); err != nil {
+			continue
+		}
+		categoryStats[result.ID] = result.Count
+	}
+	
+	return fiber.Map{
+		"by_status":   statusStats,
+		"by_category": categoryStats,
+	}, nil
+}
+// GetReferenceByAchievementID - Get reference by achievement ID
+func (r *AchievementRepository) GetReferenceByAchievementID(achievementID string) (*model.AchievementReference, error) {
+	var reference model.AchievementReference
+	
+	filter := bson.M{"achievement_id": achievementID}
+	
+	err := r.referenceCollection.FindOne(context.Background(), filter).Decode(&reference)
+	if err != nil {
+		return nil, err
+	}
+	
+	return &reference, nil
 }

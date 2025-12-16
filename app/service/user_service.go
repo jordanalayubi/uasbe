@@ -4,6 +4,8 @@ import (
 	"UASBE/app/model"
 	"UASBE/app/repository"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/gofiber/fiber/v2"
 	"golang.org/x/crypto/bcrypt"
@@ -64,38 +66,204 @@ func NewUserService(userRepo *repository.UserRepository, studentRepo *repository
 // FR-009 Step 1: Create user
 func (s *UserService) CreateUserRequest(c *fiber.Ctx) error {
 	userRole := c.Locals("role").(string)
+	adminUsername := c.Locals("username").(string)
 	
 	// Only admin can create users
 	if userRole != "admin" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only admin can create users",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can create users",
+			"code": "INSUFFICIENT_PERMISSIONS",
+			"user_role": userRole,
+			"required_role": "admin",
 		})
 	}
 
 	var req CreateUserRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": "Invalid request body",
+			"message": "Please provide valid JSON data",
+			"code": "INVALID_REQUEST_BODY",
 		})
 	}
 
-	// Validate required fields
-	if req.Username == "" || req.Email == "" || req.Password == "" || req.FullName == "" || req.Role == "" {
+	// Enhanced validation
+	validationErrors := make(map[string]string)
+	if req.Username == "" {
+		validationErrors["username"] = "Username is required"
+	}
+	if req.Email == "" {
+		validationErrors["email"] = "Email is required"
+	}
+	if req.Password == "" {
+		validationErrors["password"] = "Password is required"
+	}
+	if req.FullName == "" {
+		validationErrors["full_name"] = "Full name is required"
+	}
+	if req.Role == "" {
+		validationErrors["role"] = "Role is required"
+	}
+
+	// Validate role
+	validRoles := []string{"admin", "student", "lecturer"}
+	isValidRole := false
+	for _, role := range validRoles {
+		if req.Role == role {
+			isValidRole = true
+			break
+		}
+	}
+	if req.Role != "" && !isValidRole {
+		validationErrors["role"] = "Invalid role. Valid options: " + fmt.Sprintf("%v", validRoles)
+	}
+
+	// Role-specific validation
+	if req.Role == "student" {
+		if req.StudentID == "" {
+			validationErrors["student_id"] = "Student ID is required for students"
+		}
+		if req.ProgramStudy == "" {
+			validationErrors["program_study"] = "Program study is required for students"
+		}
+		if req.AcademicYear == "" {
+			validationErrors["academic_year"] = "Academic year is required for students"
+		}
+	}
+
+	if req.Role == "lecturer" {
+		if req.LecturerID == "" {
+			validationErrors["lecturer_id"] = "Lecturer ID is required for lecturers"
+		}
+		if req.Department == "" {
+			validationErrors["department"] = "Department is required for lecturers"
+		}
+	}
+
+	if len(validationErrors) > 0 {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Username, email, password, full_name, and role are required",
+			"success": false,
+			"error": "Validation failed",
+			"message": "Please correct the following errors",
+			"code": "VALIDATION_ERROR",
+			"details": validationErrors,
+			"valid_roles": validRoles,
+			"role_requirements": fiber.Map{
+				"student": []string{"student_id", "program_study", "academic_year"},
+				"lecturer": []string{"lecturer_id", "department"},
+				"admin": []string{},
+			},
 		})
 	}
 
 	user, err := s.CreateUser(&req)
 	if err != nil {
+		var errorCode string
+		var message string
+		
+		switch err.Error() {
+		case "username already exists":
+			errorCode = "USERNAME_EXISTS"
+			message = "Username is already taken"
+		case "email already exists":
+			errorCode = "EMAIL_EXISTS"
+			message = "Email is already registered"
+		case "role not found":
+			errorCode = "ROLE_NOT_FOUND"
+			message = "Invalid role specified"
+		default:
+			errorCode = "CREATION_FAILED"
+			message = "Failed to create user"
+		}
+		
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
 			"error": err.Error(),
+			"message": message,
+			"code": errorCode,
 		})
+	}
+
+	// Get additional profile info for response
+	var profileInfo fiber.Map
+	var permissions []string
+	
+	if req.Role == "student" {
+		student, err := s.studentRepo.GetByUserID(user.ID)
+		if err == nil {
+			profileInfo = fiber.Map{
+				"type": "student",
+				"student_id": student.StudentID,
+				"program_study": student.ProgramStudy,
+				"academic_year": student.AcademicYear,
+				"advisor_id": student.AdvisorID,
+			}
+			
+			// Get advisor info if available
+			if student.AdvisorID != "" {
+				advisor, err := s.lecturerRepo.GetByUserID(student.AdvisorID)
+				if err == nil {
+					profileInfo["advisor_info"] = fiber.Map{
+						"advisor_id": advisor.LecturerID,
+						"department": advisor.Department,
+					}
+				}
+			}
+		}
+		permissions = []string{"achievements:create", "achievements:read", "achievements:update", "achievements:delete"}
+	} else if req.Role == "lecturer" {
+		lecturer, err := s.lecturerRepo.GetByUserID(user.ID)
+		if err == nil {
+			profileInfo = fiber.Map{
+				"type": "lecturer",
+				"lecturer_id": lecturer.LecturerID,
+				"department": lecturer.Department,
+			}
+		}
+		permissions = []string{"achievements:verify", "achievements:view_advisee"}
+	} else {
+		profileInfo = fiber.Map{
+			"type": "admin",
+		}
+		permissions = []string{"users:create", "users:read", "users:update", "users:delete", "achievements:view_all"}
 	}
 
 	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
 		"success": true,
-		"data":    user,
+		"message": "User created successfully",
+		"code": "USER_CREATED",
+		"data": fiber.Map{
+			"user": fiber.Map{
+				"id": user.ID,
+				"username": user.Username,
+				"email": user.Email,
+				"full_name": user.FullName,
+				"role": req.Role,
+				"is_active": user.IsActive,
+				"created_at": user.CreatedAt,
+			},
+			"profile": profileInfo,
+			"permissions": permissions,
+		},
+		"created_by": fiber.Map{
+			"admin_username": adminUsername,
+			"timestamp": time.Now(),
+		},
+		"next_steps": []string{
+			"User account has been created successfully",
+			"User can now login with username: " + user.Username,
+			"Default password has been set (user should change it on first login)",
+			"User has been assigned appropriate permissions based on role",
+		},
+		"login_info": fiber.Map{
+			"username": user.Username,
+			"temporary_password": "Set by admin (hidden for security)",
+			"first_login_required": true,
+		},
+		"timestamp": time.Now(),
 	})
 }
 

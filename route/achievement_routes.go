@@ -89,4 +89,14 @@ func SetupAchievementRoutes(app *fiber.App, achievementService *service.Achievem
 	admin.Get("/all", 
 		middleware.AdminOnlyMiddleware(),
 		achievementService.GetAllAchievementsRequest)
+
+	// FR-011: Achievement Statistics - Role-based statistics
+	stats := api.Group("/statistics")
+	
+	// FR-011: Get achievement statistics based on user role
+	// - Student: own statistics
+	// - Lecturer: advisee statistics  
+	// - Admin: all statistics
+	stats.Get("/", 
+		achievementService.GetAchievementStatisticsRequest)
 }
