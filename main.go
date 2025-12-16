@@ -38,10 +38,13 @@ func main() {
 	studentRepo := repository.NewStudentRepository()
 	lecturerRepo := repository.NewLecturerRepository()
 	achievementRepo := repository.NewAchievementRepository()
+	notificationRepo := repository.NewNotificationRepository()
 
 	// Initialize services
 	authService := service.NewAuthService(userRepo, studentRepo, lecturerRepo, jwtSecret)
-	achievementService := service.NewAchievementService(achievementRepo, studentRepo, lecturerRepo)
+	notificationService := service.NewNotificationService(notificationRepo)
+	achievementService := service.NewAchievementService(achievementRepo, studentRepo, lecturerRepo, notificationService)
+	userService := service.NewUserService(userRepo, studentRepo, lecturerRepo)
 
 	// Create Fiber app
 	app := fiber.New(fiber.Config{
@@ -64,6 +67,8 @@ func main() {
 	// Routes
 	route.SetupAuthRoutes(app, authService)
 	route.SetupAchievementRoutes(app, achievementService, authService)
+	route.SetupNotificationRoutes(app, notificationService, authService)
+	route.SetupUserRoutes(app, userService, authService)
 	route.SetupAdminRoutes(app, authService)
 	route.SetupTestRoutes(app, authService)
 

@@ -17,46 +17,52 @@ func SetupAchievementRoutes(app *fiber.App, achievementService *service.Achievem
 	// Create achievement - students can create their own achievements
 	api.Post("/", 
 		middleware.PermissionMiddleware(authService, "achievements", "create"),
-		achievementService.HandleCreateAchievementRequest)
+		achievementService.CreateAchievementRequest)
 
 	// FR-003: Submit Prestasi - Alternative endpoint for students
 	api.Post("/submit", 
 		middleware.PermissionMiddleware(authService, "achievements", "create"),
-		achievementService.HandleCreateAchievementRequest)
+		achievementService.CreateAchievementRequest)
 
 	// Read operations - students can view their own achievements
 	api.Get("/", 
 		middleware.PermissionMiddleware(authService, "achievements", "read"),
-		achievementService.HandleGetStudentAchievements)
+		achievementService.GetStudentAchievementsRequest)
 
 	api.Get("/references", 
 		middleware.PermissionMiddleware(authService, "achievements", "read"),
-		achievementService.HandleGetStudentAchievementReferences)
+		achievementService.GetStudentAchievementReferencesRequest)
+
+	// FR-006: View Prestasi Mahasiswa Bimbingan - Dosen wali melihat prestasi mahasiswa bimbingannya
+	// IMPORTANT: This route must be BEFORE /:id route to avoid route conflict
+	api.Get("/advisee", 
+		middleware.PermissionMiddleware(authService, "achievements", "view_advisee"),
+		achievementService.GetAdviseeAchievementsRequest)
 
 	api.Get("/:id", 
 		middleware.PermissionMiddleware(authService, "achievements", "read"),
-		achievementService.HandleGetAchievementByID)
+		achievementService.GetAchievementByIDRequest)
 
 	// Update operations - students can update their own achievements
 	api.Put("/:id", 
 		middleware.PermissionMiddleware(authService, "achievements", "update"),
-		achievementService.HandleUpdateAchievementRequest)
+		achievementService.UpdateAchievementRequest)
 
 	// Delete operations - students can delete their own achievements
 	api.Delete("/:id", 
 		middleware.PermissionMiddleware(authService, "achievements", "delete"),
-		achievementService.HandleDeleteAchievementRequest)
+		achievementService.DeleteAchievementRequest)
 
 	// Submit achievement for verification - students can submit their achievements
 	api.Post("/:achievement_id/submit", 
 		middleware.PermissionMiddleware(authService, "achievements", "update"),
-		achievementService.HandleSubmitAchievementRequest)
+		achievementService.SubmitAchievementRequest)
 
 	// File upload routes - students can upload attachments
 	upload := api.Group("/upload")
 	upload.Post("/attachment", 
 		middleware.PermissionMiddleware(authService, "achievements", "create"),
-		achievementService.HandleUploadAttachment)
+		achievementService.UploadAttachmentRequest)
 
 	// Lecturer routes for verification
 	lecturer := api.Group("/verify")
@@ -64,10 +70,23 @@ func SetupAchievementRoutes(app *fiber.App, achievementService *service.Achievem
 	// Get pending verifications for lecturer
 	lecturer.Get("/pending", 
 		middleware.PermissionMiddleware(authService, "achievements", "verify"),
-		achievementService.HandleGetPendingVerifications)
+		achievementService.GetPendingVerificationsRequest)
 
-	// Verify achievement
+	// FR-007: Get verification detail - dosen review prestasi detail
+	lecturer.Get("/:reference_id", 
+		middleware.PermissionMiddleware(authService, "achievements", "verify"),
+		achievementService.GetVerificationDetailRequest)
+
+	// FR-007: Verify achievement - dosen approve/reject prestasi
 	lecturer.Post("/:reference_id", 
 		middleware.PermissionMiddleware(authService, "achievements", "verify"),
-		achievementService.HandleVerifyAchievementRequest)
+		achievementService.VerifyAchievementRequest)
+
+	// FR-010: Admin routes - View All Achievements
+	admin := api.Group("/admin")
+	
+	// FR-010: Get all achievements with filters and pagination - admin only
+	admin.Get("/all", 
+		middleware.AdminOnlyMiddleware(),
+		achievementService.GetAllAchievementsRequest)
 }

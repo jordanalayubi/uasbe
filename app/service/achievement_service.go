@@ -13,9 +13,10 @@ import (
 )
 
 type AchievementService struct {
-	achievementRepo *repository.AchievementRepository
-	studentRepo     *repository.StudentRepository
-	lecturerRepo    *repository.LecturerRepository
+	achievementRepo   *repository.AchievementRepository
+	studentRepo       *repository.StudentRepository
+	lecturerRepo      *repository.LecturerRepository
+	notificationService *NotificationService
 }
 
 type CreateAchievementRequest struct {
@@ -33,16 +34,158 @@ type VerifyAchievementRequest struct {
 	RejectionNote string `json:"rejection_note,omitempty"`
 }
 
-func NewAchievementService(achievementRepo *repository.AchievementRepository, studentRepo *repository.StudentRepository, lecturerRepo *repository.LecturerRepository) *AchievementService {
+func NewAchievementService(achievementRepo *repository.AchievementRepository, studentRepo *repository.StudentRepository, lecturerRepo *repository.LecturerRepository, notificationService *NotificationService) *AchievementService {
 	return &AchievementService{
-		achievementRepo: achievementRepo,
-		studentRepo:     studentRepo,
-		lecturerRepo:    lecturerRepo,
+		achievementRepo:     achievementRepo,
+		studentRepo:         studentRepo,
+		lecturerRepo:        lecturerRepo,
+		notificationService: notificationService,
 	}
 }
 
-// FR-003: Submit Prestasi - Handler untuk mahasiswa submit prestasi
-func (s *AchievementService) HandleCreateAchievementRequest(c *fiber.Ctx) error {
+// FR-010: View All Achievements - Admin dapat melihat semua prestasi
+func (s *AchievementService) GetAllAchievementsRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can view all achievements
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only admin can view all achievements",
+		})
+	}
+
+	// Get query parameters for filtering and pagination
+	page := c.QueryInt("page", 1)
+	limit := c.QueryInt("limit", 10)
+	status := c.Query("status", "")
+	category := c.Query("category", "")
+	studentID := c.Query("student_id", "")
+	sortBy := c.Query("sort_by", "created_at")
+	sortOrder := c.Query("sort_order", "desc")
+
+	// Validate pagination
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
+
+	// FR-010 Step 1: Get all achievement references with filters
+	references, total, err := s.achievementRepo.GetAllReferencesWithFilters(page, limit, status, studentID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get achievement references",
+		})
+	}
+
+	if len(references) == 0 {
+		return c.JSON(fiber.Map{
+			"success": true,
+			"data":    []interface{}{},
+			"pagination": fiber.Map{
+				"page":        page,
+				"limit":       limit,
+				"total":       0,
+				"total_pages": 0,
+			},
+		})
+	}
+
+	// Extract achievement IDs
+	var achievementIDs []string
+	for _, ref := range references {
+		achievementIDs = append(achievementIDs, ref.AchievementID)
+	}
+
+	// FR-010 Step 2: Fetch details dari MongoDB with filters and sorting
+	achievements, err := s.achievementRepo.GetAchievementsByIDsWithFilters(achievementIDs, category, sortBy, sortOrder)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get achievement details",
+		})
+	}
+
+	// Create map for quick lookup
+	achievementMap := make(map[string]*model.Achievement)
+	for i, achievement := range achievements {
+		achievementMap[achievement.ID.Hex()] = &achievements[i]
+	}
+
+	// Get all student IDs for batch lookup
+	studentIDs := make(map[string]bool)
+	for _, ref := range references {
+		studentIDs[ref.StudentID] = true
+	}
+
+	// Get student info batch
+	var studentIDList []string
+	for id := range studentIDs {
+		studentIDList = append(studentIDList, id)
+	}
+
+	students, err := s.studentRepo.GetStudentsByUserIDs(studentIDList)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get student information",
+		})
+	}
+
+	// Create student map for quick lookup
+	studentMap := make(map[string]*model.Student)
+	for i, student := range students {
+		studentMap[student.UserID] = &students[i]
+	}
+
+	// FR-010 Step 4: Combine data and return dengan pagination
+	var result []fiber.Map
+	for _, ref := range references {
+		achievement := achievementMap[ref.AchievementID]
+		if achievement == nil {
+			continue
+		}
+
+		student := studentMap[ref.StudentID]
+		var studentInfo fiber.Map
+		if student != nil {
+			studentInfo = fiber.Map{
+				"student_id":    student.StudentID,
+				"program_study": student.ProgramStudy,
+				"user_id":       student.UserID,
+			}
+		}
+
+		result = append(result, fiber.Map{
+			"achievement":  achievement,
+			"reference":    ref,
+			"student_info": studentInfo,
+		})
+	}
+
+	// Calculate pagination
+	totalPages := (total + limit - 1) / limit
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    result,
+		"pagination": fiber.Map{
+			"page":        page,
+			"limit":       limit,
+			"total":       total,
+			"total_pages": totalPages,
+		},
+		"filters": fiber.Map{
+			"status":     status,
+			"category":   category,
+			"student_id": studentID,
+			"sort_by":    sortBy,
+			"sort_order": sortOrder,
+		},
+	})
+}
+
+// FR-003: Submit Prestasi - Service method untuk mahasiswa submit prestasi
+func (s *AchievementService) CreateAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
 	
@@ -88,7 +231,7 @@ func (s *AchievementService) HandleCreateAchievementRequest(c *fiber.Ctx) error 
 	})
 }
 
-func (s *AchievementService) HandleGetStudentAchievements(c *fiber.Ctx) error {
+func (s *AchievementService) GetStudentAchievementsRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 
 	achievements, err := s.GetStudentAchievements(userID)
@@ -104,7 +247,7 @@ func (s *AchievementService) HandleGetStudentAchievements(c *fiber.Ctx) error {
 	})
 }
 
-func (s *AchievementService) HandleGetStudentAchievementReferences(c *fiber.Ctx) error {
+func (s *AchievementService) GetStudentAchievementReferencesRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 
 	references, err := s.GetStudentAchievementReferences(userID)
@@ -120,7 +263,7 @@ func (s *AchievementService) HandleGetStudentAchievementReferences(c *fiber.Ctx)
 	})
 }
 
-func (s *AchievementService) HandleGetAchievementByID(c *fiber.Ctx) error {
+func (s *AchievementService) GetAchievementByIDRequest(c *fiber.Ctx) error {
 	idParam := c.Params("id")
 
 	// Validate and convert ID
@@ -131,8 +274,8 @@ func (s *AchievementService) HandleGetAchievementByID(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get achievement
-	achievement, err := s.GetAchievementByID(id)
+	// Get active achievement (exclude soft deleted)
+	achievement, err := s.GetActiveAchievementByID(id)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"error": "Achievement not found",
@@ -145,7 +288,7 @@ func (s *AchievementService) HandleGetAchievementByID(c *fiber.Ctx) error {
 	})
 }
 
-func (s *AchievementService) HandleUpdateAchievementRequest(c *fiber.Ctx) error {
+func (s *AchievementService) UpdateAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	idParam := c.Params("id")
 	
@@ -178,9 +321,18 @@ func (s *AchievementService) HandleUpdateAchievementRequest(c *fiber.Ctx) error 
 	})
 }
 
-func (s *AchievementService) HandleDeleteAchievementRequest(c *fiber.Ctx) error {
+// FR-005: Hapus Prestasi - Service method untuk soft delete prestasi mahasiswa
+func (s *AchievementService) DeleteAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
 	idParam := c.Params("id")
+
+	// FR-005 Precondition: Hanya mahasiswa yang bisa hapus prestasi mereka sendiri
+	if userRole != "student" && userRole != "Mahasiswa" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only students can delete their own achievements",
+		})
+	}
 
 	// Validate and convert ID
 	id, err := primitive.ObjectIDFromHex(idParam)
@@ -190,8 +342,8 @@ func (s *AchievementService) HandleDeleteAchievementRequest(c *fiber.Ctx) error 
 		})
 	}
 
-	// Process deletion
-	err = s.DeleteAchievement(userID, id)
+	// FR-005 Flow: Soft delete prestasi
+	err = s.SoftDeleteAchievement(userID, id)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": err.Error(),
@@ -204,11 +356,21 @@ func (s *AchievementService) HandleDeleteAchievementRequest(c *fiber.Ctx) error 
 	})
 }
 
-func (s *AchievementService) HandleSubmitAchievementRequest(c *fiber.Ctx) error {
+// FR-004: Submit untuk Verifikasi - Service method untuk submit prestasi untuk verifikasi
+func (s *AchievementService) SubmitAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
 	achievementID := c.Params("achievement_id")
 
-	err := s.SubmitAchievementForVerification(userID, achievementID)
+	// FR-004 Precondition: Hanya mahasiswa yang bisa submit
+	if userRole != "student" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only students can submit achievements for verification",
+		})
+	}
+
+	// FR-004 Flow: Submit prestasi untuk verifikasi
+	updatedReference, err := s.SubmitAchievementForVerification(userID, achievementID)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": err.Error(),
@@ -218,10 +380,11 @@ func (s *AchievementService) HandleSubmitAchievementRequest(c *fiber.Ctx) error 
 	return c.JSON(fiber.Map{
 		"success": true,
 		"message": "Achievement submitted for verification",
+		"data":    updatedReference,
 	})
 }
 
-func (s *AchievementService) HandleGetPendingVerifications(c *fiber.Ctx) error {
+func (s *AchievementService) GetPendingVerificationsRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 
 	references, err := s.GetPendingVerifications(userID)
@@ -237,24 +400,77 @@ func (s *AchievementService) HandleGetPendingVerifications(c *fiber.Ctx) error {
 	})
 }
 
-func (s *AchievementService) HandleVerifyAchievementRequest(c *fiber.Ctx) error {
+// FR-007: Service method untuk get detail prestasi yang akan diverifikasi
+func (s *AchievementService) GetVerificationDetailRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
 	refIDParam := c.Params("reference_id")
-	
-	var req VerifyAchievementRequest
-	if err := c.BodyParser(&req); err != nil {
-		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
-			"error": "Invalid request body",
+
+	// FR-007 Precondition: Hanya dosen wali yang bisa akses
+	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only lecturers can view verification details",
 		})
 	}
 
-	// Validate request
+	// Validate and convert ID
+	refID, err := primitive.ObjectIDFromHex(refIDParam)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid reference ID",
+		})
+	}
+
+	// Get verification detail
+	detail, err := s.GetVerificationDetail(userID, refID)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    detail,
+	})
+}
+
+// FR-007: Verify Prestasi & FR-008: Reject Prestasi - Service method untuk dosen wali memverifikasi/menolak prestasi mahasiswa
+func (s *AchievementService) VerifyAchievementRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
+	refIDParam := c.Params("reference_id")
+
+	// FR-007 Precondition: Hanya dosen wali yang bisa verify
+	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only lecturers can verify achievements",
+		})
+	}
+	
+	var req VerifyAchievementRequest
+	if err := c.BodyParser(&req); err != nil {
+		// Debug: log the error and body content
+		fmt.Printf("DEBUG: Body parsing error: %v\n", err)
+		fmt.Printf("DEBUG: Request body: %s\n", string(c.Body()))
+		fmt.Printf("DEBUG: Content-Type: %s\n", c.Get("Content-Type"))
+		
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid request body: " + err.Error(),
+		})
+	}
+
+	// Debug: log parsed request
+	fmt.Printf("DEBUG: Parsed request - Status: %s, RejectionNote: %s\n", req.Status, req.RejectionNote)
+
+	// FR-007/FR-008 Step 1 & 2: Validate request - dosen approve atau reject prestasi
 	if req.Status != "verified" && req.Status != "rejected" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Status must be 'verified' or 'rejected'",
 		})
 	}
 
+	// FR-008 Step 1: Dosen input rejection note (required when rejecting)
 	if req.Status == "rejected" && req.RejectionNote == "" {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": "Rejection note is required when rejecting",
@@ -269,22 +485,37 @@ func (s *AchievementService) HandleVerifyAchievementRequest(c *fiber.Ctx) error 
 		})
 	}
 
-	// Process verification
-	err = s.VerifyAchievement(userID, refID, &req)
+	// FR-007/FR-008 Flow: Process verification/rejection
+	updatedReference, err := s.VerifyAchievementWithDetails(userID, refID, &req)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
 			"error": err.Error(),
 		})
 	}
 
+	// FR-007/FR-008 Step 5: Return updated status
+	var message string
+	if req.Status == "verified" {
+		message = "Achievement verified successfully"
+	} else {
+		message = "Achievement rejected successfully"
+	}
+
 	return c.JSON(fiber.Map{
 		"success": true,
-		"message": "Achievement verification updated",
+		"message": message,
+		"data": fiber.Map{
+			"reference_id":   updatedReference.ID.Hex(),
+			"status":         updatedReference.Status,
+			"verified_by":    updatedReference.VerifiedBy,
+			"verified_at":    updatedReference.VerifiedAt,
+			"rejection_note": updatedReference.RejectionNote,
+		},
 	})
 }
 
-// HandleUploadAttachment - Handle file upload for achievement attachments
-func (s *AchievementService) HandleUploadAttachment(c *fiber.Ctx) error {
+// UploadAttachmentRequest - Service method for file upload for achievement attachments
+func (s *AchievementService) UploadAttachmentRequest(c *fiber.Ctx) error {
 	// Get uploaded file
 	file, err := c.FormFile("file")
 	if err != nil {
@@ -408,11 +639,11 @@ func (s *AchievementService) CreateAchievement(studentID string, req *CreateAchi
 	return achievement, err
 }
 
-func (s *AchievementService) SubmitAchievementForVerification(studentID string, achievementID string) error {
-	// Find the reference
+func (s *AchievementService) SubmitAchievementForVerification(studentID string, achievementID string) (*model.AchievementReference, error) {
+	// FR-004 Step 1: Find the reference
 	references, err := s.achievementRepo.GetReferencesByStudentID(studentID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	var targetRef *model.AchievementReference
@@ -424,55 +655,157 @@ func (s *AchievementService) SubmitAchievementForVerification(studentID string, 
 	}
 
 	if targetRef == nil {
-		return errors.New("achievement not found")
+		return nil, errors.New("achievement not found")
 	}
 
+	// FR-004 Precondition: Prestasi berstatus 'draft'
 	if targetRef.Status != "draft" {
-		return errors.New("achievement already submitted")
+		return nil, errors.New("only draft achievements can be submitted for verification")
 	}
 
-	// Update status to submitted
+	// FR-004 Step 2: Update status menjadi 'submitted'
 	targetRef.Status = "submitted"
 	targetRef.SubmittedAt = time.Now()
+	targetRef.UpdatedAt = time.Now()
 
-	return s.achievementRepo.UpdateReference(targetRef)
-}
-
-func (s *AchievementService) VerifyAchievement(lecturerID string, referenceID primitive.ObjectID, req *VerifyAchievementRequest) error {
-	// Get the reference
-	reference, err := s.achievementRepo.GetReferenceByID(referenceID)
+	err = s.achievementRepo.UpdateReference(targetRef)
 	if err != nil {
-		return errors.New("achievement reference not found")
+		return nil, err
 	}
 
+	// FR-004 Step 3: Create notification untuk dosen wali
+	err = s.createNotificationForAdvisor(studentID, achievementID)
+	if err != nil {
+		// Log error but don't fail the submission
+		fmt.Printf("Failed to create notification: %v\n", err)
+	}
+
+	// FR-004 Step 4: Return updated status
+	return targetRef, nil
+}
+
+// Helper method to create notification for advisor
+func (s *AchievementService) createNotificationForAdvisor(studentID, achievementID string) error {
+	// Get student info
+	student, err := s.studentRepo.GetByUserID(studentID)
+	if err != nil {
+		return err
+	}
+
+	// Get student user info for name
+	// Note: We need to add a method to get user info, for now we'll use student ID
+	studentName := student.StudentID // Fallback to student ID
+
+	// Get achievement info
+	achievement, err := s.achievementRepo.GetByObjectID(achievementID)
+	if err != nil {
+		return err
+	}
+
+	// Get advisor info
+	if student.AdvisorID == "" {
+		return errors.New("student has no advisor assigned")
+	}
+
+	lecturer, err := s.lecturerRepo.GetByID(student.AdvisorID)
+	if err != nil {
+		return err
+	}
+
+	// Create notification (simplified - in real app you'd use notification service)
+	fmt.Printf("NOTIFICATION: Achievement '%s' submitted by student %s for verification by lecturer %s\n", 
+		achievement.Title, studentName, lecturer.LecturerID)
+
+	return nil
+}
+
+// FR-007: VerifyAchievementWithDetails - Main method untuk verify prestasi dengan return details
+func (s *AchievementService) VerifyAchievementWithDetails(lecturerID string, referenceID primitive.ObjectID, req *VerifyAchievementRequest) (*model.AchievementReference, error) {
+	// FR-007 Step 1: Get the reference untuk review prestasi detail
+	reference, err := s.achievementRepo.GetReferenceByID(referenceID)
+	if err != nil {
+		return nil, errors.New("achievement reference not found")
+	}
+
+	// FR-007 Precondition: Status harus 'submitted'
+	fmt.Printf("DEBUG: Reference status: '%s'\n", reference.Status)
 	if reference.Status != "submitted" {
-		return errors.New("achievement is not in submitted status")
+		return nil, fmt.Errorf("only submitted achievements can be verified. Current status: '%s'", reference.Status)
 	}
 
 	// Check if lecturer is the advisor of the student
-	student, err := s.studentRepo.GetByID(reference.StudentID)
+	student, err := s.studentRepo.GetByUserID(reference.StudentID)
 	if err != nil {
-		return errors.New("student not found")
+		return nil, errors.New("student not found")
 	}
 
 	lecturer, err := s.lecturerRepo.GetByUserID(lecturerID)
 	if err != nil {
-		return errors.New("lecturer not found")
+		return nil, errors.New("lecturer not found")
 	}
 
 	if student.AdvisorID != lecturer.ID {
-		return errors.New("you can only verify achievements of your advisees")
+		return nil, errors.New("you can only verify achievements of your advisees")
 	}
 
-	// Update reference
+	// FR-007/FR-008 Step 2 & 3: Update status menjadi 'verified' atau 'rejected'
 	reference.Status = req.Status
 	reference.VerifiedBy = lecturerID
 	reference.VerifiedAt = time.Now()
+	reference.UpdatedAt = time.Now()
+	
+	// FR-008 Step 3: Save rejection_note (if rejected)
 	if req.Status == "rejected" {
 		reference.RejectionNote = req.RejectionNote
 	}
 
-	return s.achievementRepo.UpdateReference(reference)
+	err = s.achievementRepo.UpdateReference(reference)
+	if err != nil {
+		return nil, errors.New("failed to update achievement reference: " + err.Error())
+	}
+
+	// FR-008 Step 4: Create notification untuk mahasiswa (if rejected)
+	if req.Status == "rejected" && s.notificationService != nil {
+		err = s.createRejectionNotification(reference.StudentID, reference.AchievementID, req.RejectionNote)
+		if err != nil {
+			// Log error but don't fail the verification process
+			fmt.Printf("Warning: Failed to create rejection notification: %v\n", err)
+		}
+	}
+
+	// FR-007 Step 5 / FR-008 Step 5: Return updated status
+	return reference, nil
+}
+
+// FR-008 Step 4: Create notification untuk mahasiswa when achievement is rejected
+func (s *AchievementService) createRejectionNotification(studentID, achievementID, rejectionNote string) error {
+	// Get achievement detail for notification
+	achievement, err := s.achievementRepo.GetByObjectID(achievementID)
+	if err != nil {
+		return err
+	}
+
+	// Create notification title and message
+	title := "Achievement Rejected"
+	message := fmt.Sprintf("Your achievement '%s' has been rejected by your advisor. Please review the feedback and resubmit if needed.", achievement.Title)
+	
+	// Notification data
+	data := map[string]interface{}{
+		"achievement_id":    achievementID,
+		"achievement_title": achievement.Title,
+		"rejection_note":    rejectionNote,
+		"action_required":   "review_and_resubmit",
+		"type":             "achievement_rejected",
+	}
+
+	// Create notification
+	return s.notificationService.CreateNotification(studentID, "achievement_rejected", title, message, data)
+}
+
+// Legacy method for backward compatibility
+func (s *AchievementService) VerifyAchievement(lecturerID string, referenceID primitive.ObjectID, req *VerifyAchievementRequest) error {
+	_, err := s.VerifyAchievementWithDetails(lecturerID, referenceID, req)
+	return err
 }
 
 func (s *AchievementService) GetStudentAchievements(studentID string) ([]model.Achievement, error) {
@@ -498,7 +831,7 @@ func (s *AchievementService) GetPendingVerifications(lecturerID string) ([]model
 
 	var allReferences []model.AchievementReference
 	for _, student := range students {
-		references, err := s.achievementRepo.GetReferencesByStudentID(student.ID)
+		references, err := s.achievementRepo.GetReferencesByStudentID(student.UserID)
 		if err != nil {
 			continue
 		}
@@ -514,8 +847,66 @@ func (s *AchievementService) GetPendingVerifications(lecturerID string) ([]model
 	return allReferences, nil
 }
 
+// FR-007: GetVerificationDetail - Get detail prestasi untuk review oleh dosen
+type VerificationDetail struct {
+	Reference    *model.AchievementReference `json:"reference"`
+	Achievement  *model.Achievement          `json:"achievement"`
+	StudentInfo  StudentBasicInfo            `json:"student_info"`
+}
+
+func (s *AchievementService) GetVerificationDetail(lecturerID string, referenceID primitive.ObjectID) (*VerificationDetail, error) {
+	// Get the reference
+	reference, err := s.achievementRepo.GetReferenceByID(referenceID)
+	if err != nil {
+		return nil, errors.New("achievement reference not found")
+	}
+
+	// Check if lecturer is the advisor of the student
+	student, err := s.studentRepo.GetByUserID(reference.StudentID)
+	if err != nil {
+		return nil, errors.New("student not found")
+	}
+
+	lecturer, err := s.lecturerRepo.GetByUserID(lecturerID)
+	if err != nil {
+		return nil, errors.New("lecturer not found")
+	}
+
+	if student.AdvisorID != lecturer.ID {
+		return nil, errors.New("you can only view achievements of your advisees")
+	}
+
+	// Get achievement detail from MongoDB
+	achievement, err := s.achievementRepo.GetByObjectID(reference.AchievementID)
+	if err != nil {
+		return nil, errors.New("achievement not found")
+	}
+
+	// Skip soft deleted achievements
+	if achievement.DeletedAt != nil {
+		return nil, errors.New("achievement has been deleted")
+	}
+
+	// Prepare student info
+	studentInfo := StudentBasicInfo{
+		StudentID:    student.StudentID,
+		ProgramStudy: student.ProgramStudy,
+		UserID:       student.UserID,
+	}
+
+	return &VerificationDetail{
+		Reference:   reference,
+		Achievement: achievement,
+		StudentInfo: studentInfo,
+	}, nil
+}
+
 func (s *AchievementService) GetAchievementByID(id primitive.ObjectID) (*model.Achievement, error) {
 	return s.achievementRepo.GetByID(id)
+}
+
+func (s *AchievementService) GetActiveAchievementByID(id primitive.ObjectID) (*model.Achievement, error) {
+	return s.achievementRepo.GetByIDActive(id)
 }
 
 func (s *AchievementService) UpdateAchievement(studentID string, achievementID primitive.ObjectID, req *CreateAchievementRequest) (*model.Achievement, error) {
@@ -528,6 +919,11 @@ func (s *AchievementService) UpdateAchievement(studentID string, achievementID p
 	// Check ownership
 	if achievement.StudentID != studentID {
 		return nil, errors.New("unauthorized")
+	}
+
+	// Check if achievement is deleted
+	if achievement.DeletedAt != nil {
+		return nil, errors.New("cannot update deleted achievement")
 	}
 
 	// Update fields
@@ -549,19 +945,233 @@ func (s *AchievementService) UpdateAchievement(studentID string, achievementID p
 	return achievement, nil
 }
 
-func (s *AchievementService) DeleteAchievement(studentID string, achievementID primitive.ObjectID) error {
-	// Get existing achievement
+// FR-005: SoftDeleteAchievement - Soft delete prestasi dengan validasi status draft
+func (s *AchievementService) SoftDeleteAchievement(studentID string, achievementID primitive.ObjectID) error {
+	// FR-005 Step 1: Get existing achievement
 	achievement, err := s.achievementRepo.GetByID(achievementID)
 	if err != nil {
 		return errors.New("achievement not found")
 	}
 
-	// Check ownership
+	// FR-005 Step 2: Check ownership
 	if achievement.StudentID != studentID {
-		return errors.New("unauthorized")
+		return errors.New("unauthorized: you can only delete your own achievements")
 	}
 
-	return s.achievementRepo.Delete(achievementID)
+	// FR-005 Step 3: Check if achievement is already deleted
+	if achievement.DeletedAt != nil {
+		return errors.New("achievement is already deleted")
+	}
+
+	// FR-005 Step 4: Get achievement reference to check status
+	references, err := s.achievementRepo.GetReferencesByStudentID(studentID)
+	if err != nil {
+		return errors.New("failed to get achievement references")
+	}
+
+	var targetRef *model.AchievementReference
+	for _, ref := range references {
+		if ref.AchievementID == achievement.ObjectID {
+			targetRef = &ref
+			break
+		}
+	}
+
+	if targetRef == nil {
+		return errors.New("achievement reference not found")
+	}
+
+	// FR-005 Precondition: Hanya prestasi dengan status 'draft' yang bisa dihapus
+	if targetRef.Status != "draft" {
+		return errors.New("only draft achievements can be deleted")
+	}
+
+	// FR-005 Step 5: Perform soft delete
+	now := time.Now()
+	achievement.DeletedAt = &now
+	achievement.UpdatedAt = now
+
+	err = s.achievementRepo.Update(achievement)
+	if err != nil {
+		return errors.New("failed to delete achievement: " + err.Error())
+	}
+
+	// FR-005 Step 6: Update reference status to 'deleted'
+	targetRef.Status = "deleted"
+	targetRef.UpdatedAt = now
+
+	err = s.achievementRepo.UpdateReference(targetRef)
+	if err != nil {
+		// Log error but don't fail the deletion since achievement is already soft deleted
+		fmt.Printf("Warning: Failed to update reference status to deleted: %v\n", err)
+	}
+
+	return nil
+}
+
+// Legacy method for backward compatibility (now deprecated)
+func (s *AchievementService) DeleteAchievement(studentID string, achievementID primitive.ObjectID) error {
+	return s.SoftDeleteAchievement(studentID, achievementID)
+}
+
+// FR-006: View Prestasi Mahasiswa Bimbingan - Service method untuk dosen wali
+func (s *AchievementService) GetAdviseeAchievementsRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
+
+	// FR-006 Precondition: Hanya dosen yang bisa akses
+	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only lecturers can view advisee achievements",
+		})
+	}
+
+	// Parse pagination parameters
+	page := c.QueryInt("page", 1)
+	limit := c.QueryInt("limit", 10)
+	if page < 1 {
+		page = 1
+	}
+	if limit < 1 || limit > 100 {
+		limit = 10
+	}
+	offset := (page - 1) * limit
+
+	// FR-006 Flow: Get advisee achievements with pagination
+	result, err := s.GetAdviseeAchievements(userID, limit, offset)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": err.Error(),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"data":    result.Achievements,
+		"pagination": fiber.Map{
+			"page":        page,
+			"limit":       limit,
+			"total":       result.Total,
+			"total_pages": (result.Total + int64(limit) - 1) / int64(limit),
+		},
+	})
+}
+
+// FR-006: GetAdviseeAchievements - Main method untuk get prestasi mahasiswa bimbingan
+type AdviseeAchievementsResult struct {
+	Achievements []AdviseeAchievementDetail `json:"achievements"`
+	Total        int64                      `json:"total"`
+}
+
+type AdviseeAchievementDetail struct {
+	Achievement  *model.Achievement          `json:"achievement"`
+	Reference    *model.AchievementReference `json:"reference"`
+	StudentInfo  StudentBasicInfo            `json:"student_info"`
+}
+
+type StudentBasicInfo struct {
+	StudentID    string `json:"student_id"`
+	ProgramStudy string `json:"program_study"`
+	UserID       string `json:"user_id"`
+}
+
+func (s *AchievementService) GetAdviseeAchievements(lecturerUserID string, limit, offset int) (*AdviseeAchievementsResult, error) {
+	// FR-006 Step 1: Get lecturer info
+	lecturer, err := s.lecturerRepo.GetByUserID(lecturerUserID)
+	if err != nil {
+		return nil, errors.New("lecturer not found")
+	}
+
+	// FR-006 Step 2: Get list student IDs dari tabel students where advisor_id
+	students, err := s.studentRepo.GetByAdvisorID(lecturer.ID)
+	if err != nil {
+		return nil, errors.New("failed to get advisee students: " + err.Error())
+	}
+
+	if len(students) == 0 {
+		return &AdviseeAchievementsResult{
+			Achievements: []AdviseeAchievementDetail{},
+			Total:        0,
+		}, nil
+	}
+
+	// Extract student user IDs for achievement query
+	var studentUserIDs []string
+	studentInfoMap := make(map[string]StudentBasicInfo)
+	
+	for _, student := range students {
+		studentUserIDs = append(studentUserIDs, student.UserID)
+		studentInfoMap[student.UserID] = StudentBasicInfo{
+			StudentID:    student.StudentID,
+			ProgramStudy: student.ProgramStudy,
+			UserID:       student.UserID,
+		}
+	}
+
+	// FR-006 Step 3: Get achievements references dengan filter student_ids
+	references, err := s.achievementRepo.GetReferencesByStudentIDs(studentUserIDs, limit, offset)
+	if err != nil {
+		return nil, errors.New("failed to get achievement references: " + err.Error())
+	}
+
+	// Get total count for pagination
+	totalCount, err := s.achievementRepo.CountByStudentIDs(studentUserIDs)
+	if err != nil {
+		return nil, errors.New("failed to count achievements: " + err.Error())
+	}
+
+	// FR-006 Step 4: Fetch detail dari MongoDB
+	var result []AdviseeAchievementDetail
+	
+	for _, ref := range references {
+		// Get achievement detail from MongoDB
+		achievement, err := s.achievementRepo.GetByObjectID(ref.AchievementID)
+		if err != nil {
+			// Log error but continue with other achievements
+			fmt.Printf("Warning: Failed to get achievement %s: %v\n", ref.AchievementID, err)
+			continue
+		}
+
+		// Skip soft deleted achievements
+		if achievement.DeletedAt != nil {
+			continue
+		}
+
+		// Get student info
+		studentInfo, exists := studentInfoMap[ref.StudentID]
+		if !exists {
+			// Fallback: try to get student info directly
+			student, err := s.studentRepo.GetByUserID(ref.StudentID)
+			if err != nil {
+				fmt.Printf("Warning: Failed to get student info for %s: %v\n", ref.StudentID, err)
+				studentInfo = StudentBasicInfo{
+					StudentID:    "Unknown",
+					ProgramStudy: "Unknown",
+					UserID:       ref.StudentID,
+				}
+			} else {
+				studentInfo = StudentBasicInfo{
+					StudentID:    student.StudentID,
+					ProgramStudy: student.ProgramStudy,
+					UserID:       student.UserID,
+				}
+			}
+		}
+
+		detail := AdviseeAchievementDetail{
+			Achievement: achievement,
+			Reference:   &ref,
+			StudentInfo: studentInfo,
+		}
+
+		result = append(result, detail)
+	}
+
+	// FR-006 Step 5: Return list dengan pagination
+	return &AdviseeAchievementsResult{
+		Achievements: result,
+		Total:        totalCount,
+	}, nil
 }
 
 func (s *AchievementService) mapDetailsToAchievement(achievement *model.Achievement, details map[string]interface{}, category string) {

@@ -294,7 +294,7 @@ func (s *AuthService) ValidateToken(tokenString string) (*jwt.MapClaims, error) 
 	return nil, errors.New("invalid token")
 }
 
-func (s *AuthService) HandleLoginRequest(c *fiber.Ctx) error {
+func (s *AuthService) LoginRequest(c *fiber.Ctx) error {
 	var req LoginRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
@@ -323,7 +323,7 @@ func (s *AuthService) HandleLoginRequest(c *fiber.Ctx) error {
 	})
 }
 
-func (s *AuthService) HandleRegisterRequest(c *fiber.Ctx) error {
+func (s *AuthService) RegisterRequest(c *fiber.Ctx) error {
 	var req RegisterRequest
 	if err := c.BodyParser(&req); err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{

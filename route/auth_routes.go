@@ -10,8 +10,8 @@ func SetupAuthRoutes(app *fiber.App, authService *service.AuthService) {
 	auth := app.Group("/api/auth")
 
 	// Login
-	auth.Post("/login", authService.HandleLoginRequest)
+	auth.Post("/login", authService.LoginRequest)
 
 	// Register
-	auth.Post("/register", authService.HandleRegisterRequest)
+	auth.Post("/register", authService.RegisterRequest)
 }

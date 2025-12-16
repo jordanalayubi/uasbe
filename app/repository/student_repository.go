@@ -4,6 +4,8 @@ import (
 	"UASBE/app/model"
 	"UASBE/database"
 	"database/sql"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -152,6 +154,48 @@ func (r *StudentRepository) GetAll() ([]model.Student, error) {
 	`
 	
 	rows, err := r.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	
+	for rows.Next() {
+		var student model.Student
+		err := rows.Scan(
+			&student.ID, &student.UserID, &student.StudentID, &student.ProgramStudy,
+			&student.AcademicYear, &student.AdvisorID, &student.CreatedAt,
+		)
+		if err != nil {
+			return nil, err
+		}
+		students = append(students, student)
+	}
+	
+	return students, nil
+}
+// FR-010: Get students by multiple user IDs for batch lookup
+func (r *StudentRepository) GetStudentsByUserIDs(userIDs []string) ([]model.Student, error) {
+	var students []model.Student
+	
+	if len(userIDs) == 0 {
+		return students, nil
+	}
+	
+	// Create placeholders for IN clause
+	placeholders := make([]string, len(userIDs))
+	args := make([]interface{}, len(userIDs))
+	for i, id := range userIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	
+	query := fmt.Sprintf(`
+		SELECT id, user_id, student_id, program_study, academic_year, advisor_id, created_at
+		FROM students WHERE user_id IN (%s)
+		ORDER BY created_at DESC
+	`, strings.Join(placeholders, ","))
+	
+	rows, err := r.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
