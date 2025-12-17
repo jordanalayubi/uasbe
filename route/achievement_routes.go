@@ -99,4 +99,14 @@ func SetupAchievementRoutes(app *fiber.App, achievementService *service.Achievem
 	// - Admin: all statistics
 	stats.Get("/", 
 		achievementService.GetAchievementStatisticsRequest)
+
+	// Debug endpoint - temporary for troubleshooting
+	api.Get("/debug/data", achievementService.DebugDataRequest)
+	api.Post("/debug/fix", achievementService.FixDataMismatchesRequest)
+	api.Get("/debug/advisor", achievementService.DebugAdvisorRequest)
+	api.Post("/debug/fix-advisor", achievementService.FixAdvisorRelationshipRequest)
+	api.Post("/debug/assign-student", achievementService.AssignStudentToLecturerRequest)
+	api.Get("/debug/all-data", achievementService.DebugAllDataRequest)
+	api.Get("/debug/submitted", achievementService.GetAllSubmittedAchievementsRequest)
+	api.Get("/debug/advisor-lookup", achievementService.DebugGetByAdvisorIDRequest)
 }

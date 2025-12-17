@@ -1,0 +1,319 @@
+swagger: "2.0"
+info:
+  description: "API untuk sistem manajemen prestasi mahasiswa Universitas Airlangga"
+  title: "UAS Achievement System API"
+  termsOfService: "http://swagger.io/terms/"
+  contact:
+    name: "API Support"
+    url: "http://www.swagger.io/support"
+    email: "support@swagger.io"
+  license:
+    name: "MIT"
+    url: "https://opensource.org/licenses/MIT"
+  version: "1.0"
+host: "localhost:3000"
+basePath: "/api"
+schemes:
+  - "http"
+  - "https"
+
+securityDefinitions:
+  BearerAuth:
+    type: apiKey
+    name: Authorization
+    in: header
+    description: 'Type "Bearer" followed by a space and JWT token.'
+
+paths:
+  /auth/login:
+    post:
+      tags:
+        - "Authentication"
+      summary: "User Login"
+      description: "Authenticate user with username/email and password"
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - name: "credentials"
+          in: "body"
+          description: "Login credentials"
+          required: true
+          schema:
+            $ref: "#/definitions/LoginRequest"
+      responses:
+        200:
+          description: "Login successful"
+          schema:
+            type: object
+        400:
+          description: "Bad request"
+          schema:
+            type: object
+        401:
+          description: "Unauthorized"
+          schema:
+            type: object
+
+  /achievements:
+    post:
+      tags:
+        - "Achievements"
+      summary: "Create Achievement"
+      description: "Student creates a new achievement (FR-003)"
+      security:
+        - BearerAuth: []
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - name: "achievement"
+          in: "body"
+          description: "Achievement data"
+          required: true
+          schema:
+            $ref: "#/definitions/CreateAchievementRequest"
+      responses:
+        201:
+          description: "Achievement created successfully"
+          schema:
+            type: object
+        400:
+          description: "Bad request"
+          schema:
+            type: object
+        403:
+          description: "Forbidden"
+          schema:
+            type: object
+
+  /achievements/admin/all:
+    get:
+      tags:
+        - "Achievements"
+      summary: "Get All Achievements (Admin)"
+      description: "Admin can view all achievements with filters and pagination (FR-010)"
+      security:
+        - BearerAuth: []
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - name: "page"
+          in: "query"
+          description: "Page number"
+          type: integer
+          default: 1
+        - name: "limit"
+          in: "query"
+          description: "Items per page"
+          type: integer
+          default: 10
+        - name: "status"
+          in: "query"
+          description: "Filter by status"
+          type: string
+          enum: ["draft", "submitted", "verified", "rejected"]
+        - name: "category"
+          in: "query"
+          description: "Filter by category"
+          type: string
+          enum: ["competition", "research", "community_service", "academic", "organization"]
+        - name: "student_id"
+          in: "query"
+          description: "Filter by student ID"
+          type: string
+        - name: "sort_by"
+          in: "query"
+          description: "Sort field"
+          type: string
+          enum: ["created_at", "updated_at", "title", "category"]
+          default: "created_at"
+        - name: "sort_order"
+          in: "query"
+          description: "Sort order"
+          type: string
+          enum: ["asc", "desc"]
+          default: "desc"
+      responses:
+        200:
+          description: "All achievements retrieved successfully"
+          schema:
+            type: object
+        403:
+          description: "Forbidden - Admin only"
+          schema:
+            type: object
+        500:
+          description: "Internal server error"
+          schema:
+            type: object
+
+  /achievements/statistics:
+    get:
+      tags:
+        - "Statistics"
+      summary: "Get Achievement Statistics"
+      description: |
+        Get achievement statistics based on user role (FR-011)
+        - Student: own statistics
+        - Lecturer: advisee statistics  
+        - Admin: all statistics
+      security:
+        - BearerAuth: []
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - name: "period"
+          in: "query"
+          description: "Statistics period"
+          type: string
+          enum: ["all", "year", "month"]
+          default: "all"
+        - name: "year"
+          in: "query"
+          description: "Year for statistics"
+          type: integer
+          default: 2024
+        - name: "month"
+          in: "query"
+          description: "Month for statistics (1-12)"
+          type: integer
+      responses:
+        200:
+          description: "Statistics retrieved successfully"
+          schema:
+            type: object
+        403:
+          description: "Forbidden"
+          schema:
+            type: object
+        500:
+          description: "Internal server error"
+          schema:
+            type: object
+
+  /users:
+    post:
+      tags:
+        - "User Management"
+      summary: "Create User"
+      description: "Admin creates a new user with role assignment (FR-009)"
+      security:
+        - BearerAuth: []
+      consumes:
+        - "application/json"
+      produces:
+        - "application/json"
+      parameters:
+        - name: "user"
+          in: "body"
+          description: "User data"
+          required: true
+          schema:
+            $ref: "#/definitions/CreateUserRequest"
+      responses:
+        201:
+          description: "User created successfully"
+          schema:
+            type: object
+        400:
+          description: "Bad request"
+          schema:
+            type: object
+        403:
+          description: "Forbidden - Admin only"
+          schema:
+            type: object
+
+definitions:
+  LoginRequest:
+    type: object
+    required:
+      - username
+      - password
+    properties:
+      username:
+        type: string
+        description: "Username or email"
+      password:
+        type: string
+        description: "User password"
+
+  CreateAchievementRequest:
+    type: object
+    required:
+      - category
+      - title
+      - description
+    properties:
+      category:
+        type: string
+        enum: ["competition", "research", "community_service", "academic", "organization"]
+        description: "Achievement category"
+      title:
+        type: string
+        description: "Achievement title"
+      description:
+        type: string
+        description: "Achievement description"
+      details:
+        type: object
+        description: "Achievement details (dynamic based on category)"
+      tags:
+        type: array
+        items:
+          type: string
+        description: "Achievement tags"
+
+  CreateUserRequest:
+    type: object
+    required:
+      - username
+      - email
+      - password
+      - full_name
+      - role
+    properties:
+      username:
+        type: string
+        description: "Unique username"
+      email:
+        type: string
+        description: "User email"
+      password:
+        type: string
+        description: "User password"
+      full_name:
+        type: string
+        description: "User full name"
+      role:
+        type: string
+        enum: ["admin", "student", "lecturer"]
+        description: "User role"
+      is_active:
+        type: boolean
+        description: "User active status"
+      student_id:
+        type: string
+        description: "Student ID (required for student role)"
+      program_study:
+        type: string
+        description: "Program study (required for student role)"
+      academic_year:
+        type: string
+        description: "Academic year (required for student role)"
+      advisor_id:
+        type: string
+        description: "Advisor ID (optional for student role)"
+      lecturer_id:
+        type: string
+        description: "Lecturer ID (required for lecturer role)"
+      department:
+        type: string
+        description: "Department (required for lecturer role)"

@@ -13,7 +13,30 @@ import (
 	"github.com/gofiber/fiber/v2/middleware/logger"
 	"github.com/gofiber/fiber/v2/middleware/recover"
 	"github.com/joho/godotenv"
+	"github.com/swaggo/fiber-swagger"
+	_ "UASBE/docs" // Import generated docs
 )
+
+// @title UAS Achievement System API
+// @version 1.0
+// @description API untuk sistem manajemen prestasi mahasiswa Universitas Airlangga
+// @termsOfService http://swagger.io/terms/
+
+// @contact.name API Support
+// @contact.url http://www.swagger.io/support
+// @contact.email support@swagger.io
+
+// @license.name MIT
+// @license.url https://opensource.org/licenses/MIT
+
+// @host localhost:3000
+// @BasePath /api
+// @schemes http https
+
+// @securityDefinitions.apikey BearerAuth
+// @in header
+// @name Authorization
+// @description Type "Bearer" followed by a space and JWT token.
 
 func main() {
 	// Load .env file
@@ -71,6 +94,9 @@ func main() {
 	route.SetupUserRoutes(app, userService, authService)
 	route.SetupAdminRoutes(app, authService)
 	route.SetupTestRoutes(app, authService)
+
+	// Swagger documentation
+	app.Get("/swagger/*", fiberSwagger.WrapHandler)
 
 	// Health check
 	app.Get("/", func(c *fiber.Ctx) error {

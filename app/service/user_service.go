@@ -64,6 +64,18 @@ func NewUserService(userRepo *repository.UserRepository, studentRepo *repository
 }
 
 // FR-009 Step 1: Create user
+// CreateUserRequest handles user creation
+// @Summary Create User
+// @Description Admin creates a new user with role assignment (FR-009)
+// @Tags User Management
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param user body CreateUserRequest true "User data"
+// @Success 201 {object} map[string]interface{} "User created successfully"
+// @Failure 400 {object} map[string]interface{} "Bad request"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users [post]
 func (s *UserService) CreateUserRequest(c *fiber.Ctx) error {
 	userRole := c.Locals("role").(string)
 	adminUsername := c.Locals("username").(string)

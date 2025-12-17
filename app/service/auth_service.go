@@ -294,6 +294,17 @@ func (s *AuthService) ValidateToken(tokenString string) (*jwt.MapClaims, error) 
 	return nil, errors.New("invalid token")
 }
 
+// LoginRequest handles user login
+// @Summary User Login
+// @Description Authenticate user with username/email and password
+// @Tags Authentication
+// @Accept json
+// @Produce json
+// @Param credentials body LoginRequest true "Login credentials"
+// @Success 200 {object} map[string]interface{} "Login successful"
+// @Failure 400 {object} map[string]interface{} "Bad request"
+// @Failure 401 {object} map[string]interface{} "Unauthorized"
+// @Router /auth/login [post]
 func (s *AuthService) LoginRequest(c *fiber.Ctx) error {
 	var req LoginRequest
 	if err := c.BodyParser(&req); err != nil {

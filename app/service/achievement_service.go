@@ -44,6 +44,24 @@ func NewAchievementService(achievementRepo *repository.AchievementRepository, st
 }
 
 // FR-010: View All Achievements - Admin dapat melihat semua prestasi
+// GetAllAchievementsRequest handles admin view of all achievements
+// @Summary Get All Achievements (Admin)
+// @Description Admin can view all achievements with filters and pagination (FR-010)
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param page query int false "Page number" default(1)
+// @Param limit query int false "Items per page" default(10)
+// @Param status query string false "Filter by status" Enums(draft, submitted, verified, rejected)
+// @Param category query string false "Filter by category" Enums(competition, research, community_service, academic, organization)
+// @Param student_id query string false "Filter by student ID"
+// @Param sort_by query string false "Sort field" Enums(created_at, updated_at, title, category) default(created_at)
+// @Param sort_order query string false "Sort order" Enums(asc, desc) default(desc)
+// @Success 200 {object} map[string]interface{} "All achievements retrieved successfully"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Failure 500 {object} map[string]interface{} "Internal server error"
+// @Router /achievements/admin/all [get]
 func (s *AchievementService) GetAllAchievementsRequest(c *fiber.Ctx) error {
 	userRole := c.Locals("role").(string)
 	
@@ -270,6 +288,18 @@ func (s *AchievementService) GetAllAchievementsRequest(c *fiber.Ctx) error {
 }
 
 // FR-003: Submit Prestasi - Service method untuk mahasiswa submit prestasi
+// CreateAchievementRequest handles achievement creation
+// @Summary Create Achievement
+// @Description Student creates a new achievement (FR-003)
+// @Tags Achievements
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param achievement body CreateAchievementRequest true "Achievement data"
+// @Success 201 {object} map[string]interface{} "Achievement created successfully"
+// @Failure 400 {object} map[string]interface{} "Bad request"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Router /achievements [post]
 func (s *AchievementService) CreateAchievementRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
@@ -1767,8 +1797,14 @@ func (s *AchievementService) GetAdviseeAchievements(lecturerUserID string, limit
 	var result []AdviseeAchievementDetail
 	
 	for _, ref := range references {
-		// Get achievement detail from MongoDB
-		achievement, err := s.achievementRepo.GetByObjectID(ref.AchievementID)
+		// Get achievement detail from MongoDB using ObjectID
+		achievementObjID, err := primitive.ObjectIDFromHex(ref.AchievementID)
+		if err != nil {
+			fmt.Printf("Warning: Invalid achievement ID %s: %v\n", ref.AchievementID, err)
+			continue
+		}
+		
+		achievement, err := s.achievementRepo.GetByID(achievementObjID)
 		if err != nil {
 			// Log error but continue with other achievements
 			fmt.Printf("Warning: Failed to get achievement %s: %v\n", ref.AchievementID, err)
@@ -1883,6 +1919,23 @@ func (s *AchievementService) mapDetailsToAchievement(achievement *model.Achievem
 	}
 }
 // FR-011: Achievement Statistics - Generate statistik prestasi
+// GetAchievementStatisticsRequest handles achievement statistics
+// @Summary Get Achievement Statistics
+// @Description Get achievement statistics based on user role (FR-011)
+// @Description - Student: own statistics
+// @Description - Lecturer: advisee statistics  
+// @Description - Admin: all statistics
+// @Tags Statistics
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param period query string false "Statistics period" Enums(all, year, month) default(all)
+// @Param year query int false "Year for statistics" default(2024)
+// @Param month query int false "Month for statistics (1-12)"
+// @Success 200 {object} map[string]interface{} "Statistics retrieved successfully"
+// @Failure 403 {object} map[string]interface{} "Forbidden"
+// @Failure 500 {object} map[string]interface{} "Internal server error"
+// @Router /achievements/statistics [get]
 func (s *AchievementService) GetAchievementStatisticsRequest(c *fiber.Ctx) error {
 	userID := c.Locals("user_id").(string)
 	userRole := c.Locals("role").(string)
@@ -2391,4 +2444,571 @@ func (s *AchievementService) sumMapValues(m map[int]int) int {
 		sum += v
 	}
 	return sum
+}
+
+// Debug method to check data consistency
+func (s *AchievementService) DebugDataRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	
+	// Get all achievements for this user
+	achievements, err := s.achievementRepo.GetByStudentID(userID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get achievements",
+			"details": err.Error(),
+		})
+	}
+	
+	// Get all references for this user
+	references, err := s.achievementRepo.GetReferencesByStudentID(userID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get references",
+			"details": err.Error(),
+		})
+	}
+	
+	// Check for mismatches
+	var mismatches []fiber.Map
+	for _, ref := range references {
+		found := false
+		for _, achievement := range achievements {
+			if achievement.ID.Hex() == ref.AchievementID {
+				found = true
+				break
+			}
+		}
+		if !found {
+			mismatches = append(mismatches, fiber.Map{
+				"reference_id": ref.ID.Hex(),
+				"achievement_id": ref.AchievementID,
+				"status": ref.Status,
+				"problem": "Achievement not found",
+			})
+		}
+	}
+	
+	return c.JSON(fiber.Map{
+		"user_id": userID,
+		"achievements": achievements,
+		"references": references,
+		"mismatches": mismatches,
+		"summary": fiber.Map{
+			"achievement_count": len(achievements),
+			"reference_count": len(references),
+			"mismatch_count": len(mismatches),
+		},
+	})
+}
+// Fix data mismatches
+func (s *AchievementService) FixDataMismatchesRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	
+	// Get all achievements for this user
+	achievements, err := s.achievementRepo.GetByStudentID(userID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get achievements",
+			"details": err.Error(),
+		})
+	}
+	
+	// Get all references for this user
+	references, err := s.achievementRepo.GetReferencesByStudentID(userID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get references",
+			"details": err.Error(),
+		})
+	}
+	
+	// Create map of achievements for quick lookup
+	achievementMap := make(map[string]*model.Achievement)
+	for i, achievement := range achievements {
+		achievementMap[achievement.ID.Hex()] = &achievements[i]
+	}
+	
+	var fixes []fiber.Map
+	var errors []fiber.Map
+	
+	// Fix each reference
+	for _, ref := range references {
+		// Skip if reference already points to existing achievement
+		if _, exists := achievementMap[ref.AchievementID]; exists {
+			continue
+		}
+		
+		// Try to find the correct achievement by matching similar IDs or other criteria
+		var correctAchievement *model.Achievement
+		
+		// Strategy 1: Find achievement with similar ID (off by 1 character)
+		for _, achievement := range achievements {
+			achievementID := achievement.ID.Hex()
+			if len(achievementID) == len(ref.AchievementID) {
+				// Count different characters
+				diff := 0
+				for i := 0; i < len(achievementID); i++ {
+					if achievementID[i] != ref.AchievementID[i] {
+						diff++
+					}
+				}
+				// If only 1 character different, likely a match
+				if diff == 1 {
+					correctAchievement = &achievement
+					break
+				}
+			}
+		}
+		
+		// Strategy 2: If no similar ID found, match by creation time (within 1 second)
+		if correctAchievement == nil {
+			for _, achievement := range achievements {
+				timeDiff := achievement.CreatedAt.Sub(ref.CreatedAt)
+				if timeDiff < time.Second && timeDiff > -time.Second {
+					correctAchievement = &achievement
+					break
+				}
+			}
+		}
+		
+		if correctAchievement != nil {
+			// Update the reference
+			ref.AchievementID = correctAchievement.ID.Hex()
+			err := s.achievementRepo.UpdateReference(&ref)
+			if err != nil {
+				errors = append(errors, fiber.Map{
+					"reference_id": ref.ID.Hex(),
+					"error": err.Error(),
+				})
+			} else {
+				fixes = append(fixes, fiber.Map{
+					"reference_id": ref.ID.Hex(),
+					"old_achievement_id": ref.AchievementID,
+					"new_achievement_id": correctAchievement.ID.Hex(),
+					"status": ref.Status,
+				})
+			}
+		} else {
+			errors = append(errors, fiber.Map{
+				"reference_id": ref.ID.Hex(),
+				"achievement_id": ref.AchievementID,
+				"error": "No matching achievement found",
+			})
+		}
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Data mismatch fix completed",
+		"fixes_applied": fixes,
+		"errors": errors,
+		"summary": fiber.Map{
+			"total_references": len(references),
+			"fixes_applied": len(fixes),
+			"errors": len(errors),
+		},
+	})
+}
+// Debug advisor relationship
+func (s *AchievementService) DebugAdvisorRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
+	
+	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only lecturers can access this debug endpoint",
+		})
+	}
+	
+	// Get lecturer info
+	lecturer, err := s.lecturerRepo.GetByUserID(userID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Lecturer not found",
+			"details": err.Error(),
+		})
+	}
+	
+	// Get all students to see advisor relationships
+	allStudents, err := s.studentRepo.GetAll()
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get students",
+			"details": err.Error(),
+		})
+	}
+	
+	// Find students with this lecturer as advisor
+	var adviseeStudents []model.Student
+	var otherStudents []model.Student
+	
+	for _, student := range allStudents {
+		if student.AdvisorID == lecturer.ID || student.AdvisorID == userID {
+			adviseeStudents = append(adviseeStudents, student)
+		} else {
+			otherStudents = append(otherStudents, student)
+		}
+	}
+	
+	return c.JSON(fiber.Map{
+		"lecturer_info": fiber.Map{
+			"user_id": userID,
+			"lecturer_id": lecturer.LecturerID,
+			"lecturer_internal_id": lecturer.ID,
+			"department": lecturer.Department,
+		},
+		"advisee_students": adviseeStudents,
+		"other_students": otherStudents,
+		"summary": fiber.Map{
+			"total_students": len(allStudents),
+			"advisee_count": len(adviseeStudents),
+			"other_count": len(otherStudents),
+		},
+	})
+}
+// Fix advisor relationship - assign students to lecturers
+func (s *AchievementService) FixAdvisorRelationshipRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can fix advisor relationships
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only admin can fix advisor relationships",
+		})
+	}
+	
+	// Get all students without advisors
+	allStudents, err := s.studentRepo.GetAll()
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get students",
+			"details": err.Error(),
+		})
+	}
+	
+	// Get all lecturers
+	allLecturers, err := s.lecturerRepo.GetAll()
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get lecturers",
+			"details": err.Error(),
+		})
+	}
+	
+	if len(allLecturers) == 0 {
+		return c.JSON(fiber.Map{
+			"error": "No lecturers found",
+		})
+	}
+	
+	var fixes []fiber.Map
+	var errors []fiber.Map
+	
+	// Assign students to the first available lecturer (for testing)
+	defaultLecturer := allLecturers[0]
+	
+	for _, student := range allStudents {
+		// If student doesn't have advisor or has invalid advisor
+		if student.AdvisorID == "" {
+			// Update student with advisor
+			student.AdvisorID = defaultLecturer.UserID // Use lecturer's UserID
+			
+			err := s.studentRepo.Update(&student)
+			if err != nil {
+				errors = append(errors, fiber.Map{
+					"student_id": student.StudentID,
+					"error": err.Error(),
+				})
+			} else {
+				fixes = append(fixes, fiber.Map{
+					"student_id": student.StudentID,
+					"student_user_id": student.UserID,
+					"assigned_advisor_id": defaultLecturer.UserID,
+					"advisor_name": defaultLecturer.LecturerID,
+				})
+			}
+		}
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Advisor relationship fix completed",
+		"default_lecturer": fiber.Map{
+			"user_id": defaultLecturer.UserID,
+			"lecturer_id": defaultLecturer.LecturerID,
+			"department": defaultLecturer.Department,
+		},
+		"fixes_applied": fixes,
+		"errors": errors,
+		"summary": fiber.Map{
+			"total_students": len(allStudents),
+			"fixes_applied": len(fixes),
+			"errors": len(errors),
+		},
+	})
+}
+// Quick fix - assign current student to current lecturer
+func (s *AchievementService) AssignStudentToLecturerRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can assign students to lecturers
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only admin can assign students to lecturers",
+		})
+	}
+	
+	// Get request body
+	var req struct {
+		StudentUserID   string `json:"student_user_id"`
+		LecturerUserID  string `json:"lecturer_user_id"`
+	}
+	
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Invalid request body",
+		})
+	}
+	
+	// Get student
+	student, err := s.studentRepo.GetByUserID(req.StudentUserID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Student not found",
+			"student_user_id": req.StudentUserID,
+		})
+	}
+	
+	// Get lecturer
+	lecturer, err := s.lecturerRepo.GetByUserID(req.LecturerUserID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Lecturer not found",
+			"lecturer_user_id": req.LecturerUserID,
+		})
+	}
+	
+	// Update student's advisor - use lecturer's internal ID, not UserID
+	student.AdvisorID = lecturer.ID // Use lecturer's internal ID for foreign key
+	err = s.studentRepo.Update(student)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to update student advisor",
+			"details": err.Error(),
+		})
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Student assigned to lecturer successfully",
+		"assignment": fiber.Map{
+			"student": fiber.Map{
+				"user_id": student.UserID,
+				"student_id": student.StudentID,
+				"program_study": student.ProgramStudy,
+			},
+			"lecturer": fiber.Map{
+				"user_id": lecturer.UserID,
+				"lecturer_id": lecturer.LecturerID,
+				"department": lecturer.Department,
+			},
+		},
+	})
+}
+// Debug all data - show students, lecturers, and relationships
+func (s *AchievementService) DebugAllDataRequest(c *fiber.Ctx) error {
+	// Get all students
+	allStudents, err := s.studentRepo.GetAll()
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get students",
+			"details": err.Error(),
+		})
+	}
+	
+	// Get all lecturers
+	allLecturers, err := s.lecturerRepo.GetAll()
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get lecturers",
+			"details": err.Error(),
+		})
+	}
+	
+	// Format student data with advisor info
+	var studentData []fiber.Map
+	for _, student := range allStudents {
+		studentInfo := fiber.Map{
+			"user_id": student.UserID,
+			"student_id": student.StudentID,
+			"program_study": student.ProgramStudy,
+			"advisor_id": student.AdvisorID,
+			"advisor_status": "no_advisor",
+		}
+		
+		// Check if advisor exists
+		if student.AdvisorID != "" {
+			for _, lecturer := range allLecturers {
+				if lecturer.ID == student.AdvisorID {
+					studentInfo["advisor_status"] = "advisor_found"
+					studentInfo["advisor_lecturer_id"] = lecturer.LecturerID
+					studentInfo["advisor_user_id"] = lecturer.UserID
+					break
+				}
+			}
+			if studentInfo["advisor_status"] == "no_advisor" {
+				studentInfo["advisor_status"] = "advisor_not_found"
+			}
+		}
+		
+		studentData = append(studentData, studentInfo)
+	}
+	
+	// Format lecturer data
+	var lecturerData []fiber.Map
+	for _, lecturer := range allLecturers {
+		lecturerInfo := fiber.Map{
+			"internal_id": lecturer.ID,
+			"user_id": lecturer.UserID,
+			"lecturer_id": lecturer.LecturerID,
+			"department": lecturer.Department,
+		}
+		lecturerData = append(lecturerData, lecturerInfo)
+	}
+	
+	return c.JSON(fiber.Map{
+		"students": studentData,
+		"lecturers": lecturerData,
+		"summary": fiber.Map{
+			"total_students": len(allStudents),
+			"total_lecturers": len(allLecturers),
+		},
+	})
+}
+// Temporary endpoint to show all submitted achievements for lecturer
+func (s *AchievementService) GetAllSubmittedAchievementsRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only lecturers can access
+	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only lecturers can access this endpoint",
+		})
+	}
+	
+	// Get all references with status "submitted"
+	references, err := s.achievementRepo.GetReferencesByStatus("submitted")
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Failed to get submitted achievements",
+			"details": err.Error(),
+		})
+	}
+	
+	var result []fiber.Map
+	
+	for _, ref := range references {
+		// Get achievement detail
+		achievementObjID, err := primitive.ObjectIDFromHex(ref.AchievementID)
+		if err != nil {
+			continue
+		}
+		
+		achievement, err := s.achievementRepo.GetByID(achievementObjID)
+		if err != nil {
+			continue
+		}
+		
+		// Get student info
+		student, err := s.studentRepo.GetByUserID(ref.StudentID)
+		if err != nil {
+			continue
+		}
+		
+		result = append(result, fiber.Map{
+			"reference_id": ref.ID.Hex(),
+			"achievement_id": ref.AchievementID,
+			"status": ref.Status,
+			"submitted_at": ref.SubmittedAt,
+			"achievement": fiber.Map{
+				"title": achievement.Title,
+				"category": achievement.Category,
+				"description": achievement.Description,
+				"created_at": achievement.CreatedAt,
+			},
+			"student": fiber.Map{
+				"student_id": student.StudentID,
+				"program_study": student.ProgramStudy,
+				"user_id": student.UserID,
+			},
+		})
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "All submitted achievements retrieved",
+		"data": result,
+		"total": len(result),
+	})
+}
+// Debug GetByAdvisorID method
+func (s *AchievementService) DebugGetByAdvisorIDRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	userRole := c.Locals("role").(string)
+	
+	if userRole != "lecturer" && userRole != "Dosen" && userRole != "Dosen Wali" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only lecturers can access this endpoint",
+		})
+	}
+	
+	// Get lecturer info
+	lecturer, err := s.lecturerRepo.GetByUserID(userID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "Lecturer not found",
+			"details": err.Error(),
+		})
+	}
+	
+	// Try GetByAdvisorID
+	students, err := s.studentRepo.GetByAdvisorID(lecturer.ID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "GetByAdvisorID failed",
+			"lecturer_id": lecturer.ID,
+			"details": err.Error(),
+		})
+	}
+	
+	// Get student user IDs
+	var studentUserIDs []string
+	for _, student := range students {
+		studentUserIDs = append(studentUserIDs, student.UserID)
+	}
+	
+	// Try to get references for these students
+	references, err := s.achievementRepo.GetReferencesByStudentIDs(studentUserIDs, 10, 0)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"error": "GetReferencesByStudentIDs failed",
+			"student_user_ids": studentUserIDs,
+			"details": err.Error(),
+		})
+	}
+	
+	return c.JSON(fiber.Map{
+		"lecturer_info": fiber.Map{
+			"user_id": lecturer.UserID,
+			"internal_id": lecturer.ID,
+			"lecturer_id": lecturer.LecturerID,
+		},
+		"students_found": students,
+		"student_user_ids": studentUserIDs,
+		"references_found": references,
+		"debug_info": fiber.Map{
+			"students_count": len(students),
+			"references_count": len(references),
+		},
+	})
 }
