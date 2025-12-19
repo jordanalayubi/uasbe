@@ -8,7 +8,6 @@ import (
 type Achievement struct {
 	ID          primitive.ObjectID `bson:"_id,omitempty" json:"id"`
 	StudentID   string             `bson:"student_id" json:"student_id"` // PostgreSQL UUID as string
-	ObjectID    string             `bson:"object_id" json:"object_id"`
 	StudentInfo string             `bson:"student_info" json:"student_info"`
 	Category    string             `bson:"category" json:"category"`
 	Title       string             `bson:"title" json:"title"`

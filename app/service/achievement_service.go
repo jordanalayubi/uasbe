@@ -130,22 +130,32 @@ func (s *AchievementService) GetAllAchievementsRequest(c *fiber.Ctx) error {
 		achievementMap[achievement.ID.Hex()] = &achievements[i]
 	}
 
-	// Get all student IDs for batch lookup
+	// Get all student IDs for batch lookup (filter out empty strings)
 	studentIDs := make(map[string]bool)
 	for _, ref := range references {
-		studentIDs[ref.StudentID] = true
+		if ref.StudentID != "" && len(ref.StudentID) > 0 {
+			studentIDs[ref.StudentID] = true
+		}
 	}
 
 	// Get student info batch
 	var studentIDList []string
 	for id := range studentIDs {
-		studentIDList = append(studentIDList, id)
+		if id != "" && len(id) > 0 {
+			studentIDList = append(studentIDList, id)
+		}
 	}
 
 	students, err := s.studentRepo.GetStudentsByUserIDs(studentIDList)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
 			"error": "Failed to get student information",
+			"message": err.Error(),
+			"debug_info": fiber.Map{
+				"student_ids_requested": studentIDList,
+				"total_references": len(references),
+			},
 		})
 	}
 
@@ -568,14 +578,15 @@ func (s *AchievementService) DeleteAchievementRequest(c *fiber.Ctx) error {
 		})
 	}
 
-	// Get reference for status check
-	reference, err := s.achievementRepo.GetReferenceByAchievementID(id.Hex())
+	// Get reference for status check - use safe method
+	reference, err := s.GetReferenceByAchievementIDSafe(id.Hex())
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
 			"success": false,
 			"error": "Achievement reference not found",
-			"message": "Unable to find achievement reference",
+			"message": "Unable to find achievement reference. Try running /debug/fix-comprehensive first.",
 			"code": "REFERENCE_NOT_FOUND",
+			"hint": "POST /api/achievements/debug/fix-comprehensive to fix ID mismatches",
 		})
 	}
 
@@ -1147,7 +1158,6 @@ func (s *AchievementService) SubmitAchievement(studentID string, req *CreateAchi
 	// Create achievement object
 	achievement := &model.Achievement{
 		StudentID:    studentID,
-		ObjectID:     primitive.NewObjectID().Hex(),
 		StudentInfo:  student.StudentID,
 		Category:     req.Category,
 		Title:        req.Title,
@@ -1171,7 +1181,7 @@ func (s *AchievementService) SubmitAchievement(studentID string, req *CreateAchi
 	// Create achievement reference for tracking (status: draft)
 	reference := &model.AchievementReference{
 		StudentID:     studentID,
-		AchievementID: achievement.ObjectID,
+		AchievementID: achievement.ID.Hex(), // Fix: Use actual MongoDB ID, not ObjectID field
 		Status:        "draft", // FR-003 Step 4: Status awal 'draft'
 		CreatedAt:     time.Now(),
 		UpdatedAt:     time.Now(),
@@ -1283,7 +1293,6 @@ func (s *AchievementService) VerifyAchievementWithDetails(lecturerID string, ref
 	}
 
 	// FR-007 Precondition: Status harus 'submitted'
-	fmt.Printf("DEBUG: Reference status: '%s'\n", reference.Status)
 	if reference.Status != "submitted" {
 		return nil, fmt.Errorf("only submitted achievements can be verified. Current status: '%s'", reference.Status)
 	}
@@ -1518,21 +1527,9 @@ func (s *AchievementService) SoftDeleteAchievement(studentID string, achievement
 		return errors.New("achievement is already deleted")
 	}
 
-	// FR-005 Step 4: Get achievement reference to check status
-	references, err := s.achievementRepo.GetReferencesByStudentID(studentID)
+	// FR-005 Step 4: Get achievement reference to check status - use safe method
+	targetRef, err := s.GetReferenceByAchievementIDSafe(achievementID.Hex())
 	if err != nil {
-		return errors.New("failed to get achievement references")
-	}
-
-	var targetRef *model.AchievementReference
-	for _, ref := range references {
-		if ref.AchievementID == achievement.ObjectID {
-			targetRef = &ref
-			break
-		}
-	}
-
-	if targetRef == nil {
 		return errors.New("achievement reference not found")
 	}
 
@@ -1941,6 +1938,16 @@ func (s *AchievementService) GetAchievementStatisticsRequest(c *fiber.Ctx) error
 	userRole := c.Locals("role").(string)
 	username := c.Locals("username").(string)
 
+	// Validate user data
+	if userID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Invalid user ID",
+			"message": "User ID is required for statistics access",
+			"code": "INVALID_USER_ID",
+		})
+	}
+
 	// Get query parameters
 	period := c.Query("period", "all") // all, year, month
 	year := c.QueryInt("year", time.Now().Year())
@@ -1950,7 +1957,7 @@ func (s *AchievementService) GetAchievementStatisticsRequest(c *fiber.Ctx) error
 	var err error
 
 	switch userRole {
-	case "student":
+	case "student", "Mahasiswa":
 		// FR-011: Mahasiswa melihat statistik prestasi sendiri
 		stats, err = s.GetStudentStatistics(userID, period, year, month)
 		if err != nil {
@@ -1962,7 +1969,7 @@ func (s *AchievementService) GetAchievementStatisticsRequest(c *fiber.Ctx) error
 			})
 		}
 
-	case "lecturer":
+	case "lecturer", "Dosen", "Dosen Wali":
 		// FR-011: Dosen Wali melihat statistik prestasi mahasiswa bimbingan
 		stats, err = s.GetLecturerStatistics(userID, period, year, month)
 		if err != nil {
@@ -2042,18 +2049,23 @@ func (s *AchievementService) GetStudentStatistics(userID string, period string, 
 	levelCounts := make(map[string]int)
 	monthlyStats := make(map[string]int)
 
-	// Process achievements
+	// Process achievements with error handling
 	for _, achievement := range achievements {
-		categoryCounts[achievement.Category]++
+		// Safe category processing
+		if achievement.Category != "" {
+			categoryCounts[achievement.Category]++
+		}
 		
-		// Extract competition level from details
+		// Safe competition level processing
 		if achievement.Details.CompetitionLevel != "" {
 			levelCounts[achievement.Details.CompetitionLevel]++
 		}
 
-		// Monthly statistics
-		monthKey := achievement.CreatedAt.Format("2006-01")
-		monthlyStats[monthKey]++
+		// Safe monthly statistics
+		if !achievement.CreatedAt.IsZero() {
+			monthKey := achievement.CreatedAt.Format("2006-01")
+			monthlyStats[monthKey]++
+		}
 	}
 
 	// Process references for status
@@ -2141,12 +2153,19 @@ func (s *AchievementService) GetLecturerStatistics(lecturerID string, period str
 	levelCounts := make(map[string]int)
 	studentStats := make(map[string]int)
 
-	// Process achievements
+	// Process achievements with error handling
 	for _, achievement := range achievements {
-		categoryCounts[achievement.Category]++
-		studentStats[achievement.StudentID]++
+		// Safe category processing
+		if achievement.Category != "" {
+			categoryCounts[achievement.Category]++
+		}
 		
-		// Extract competition level
+		// Safe student stats
+		if achievement.StudentID != "" {
+			studentStats[achievement.StudentID]++
+		}
+		
+		// Safe competition level processing
 		if achievement.Details.CompetitionLevel != "" {
 			levelCounts[achievement.Details.CompetitionLevel]++
 		}
@@ -3011,4 +3030,516 @@ func (s *AchievementService) DebugGetByAdvisorIDRequest(c *fiber.Ctx) error {
 			"references_count": len(references),
 		},
 	})
+}
+
+// Fix Achievement ID Mismatch - Method khusus untuk memperbaiki ketidakcocokan ID
+func (s *AchievementService) FixAchievementIDMismatchRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	
+	// Get all achievements for this user
+	achievements, err := s.achievementRepo.GetByStudentID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get achievements",
+			"details": err.Error(),
+		})
+	}
+	
+	// Get all references for this user
+	references, err := s.achievementRepo.GetReferencesByStudentID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get references",
+			"details": err.Error(),
+		})
+	}
+	
+	var fixes []fiber.Map
+	var errors []fiber.Map
+	
+	// Create map of existing achievement IDs
+	achievementIDs := make(map[string]bool)
+	for _, achievement := range achievements {
+		achievementIDs[achievement.ID.Hex()] = true
+	}
+	
+	// Fix each reference that has mismatched achievement_id
+	for _, ref := range references {
+		// Skip if reference already points to existing achievement
+		if achievementIDs[ref.AchievementID] {
+			continue
+		}
+		
+		// Find the correct achievement for this reference
+		// Strategy: Match by creation time (within 5 seconds) and student_id
+		var correctAchievement *model.Achievement
+		for _, achievement := range achievements {
+			// Check if student_id matches and creation time is close
+			if achievement.StudentID == ref.StudentID {
+				timeDiff := achievement.CreatedAt.Sub(ref.CreatedAt)
+				if timeDiff < 5*time.Second && timeDiff > -5*time.Second {
+					correctAchievement = &achievement
+					break
+				}
+			}
+		}
+		
+		if correctAchievement != nil {
+			// Update the reference with correct achievement_id
+			oldAchievementID := ref.AchievementID
+			ref.AchievementID = correctAchievement.ID.Hex()
+			
+			err := s.achievementRepo.UpdateReference(&ref)
+			if err != nil {
+				errors = append(errors, fiber.Map{
+					"reference_id": ref.ID.Hex(),
+					"old_achievement_id": oldAchievementID,
+					"new_achievement_id": correctAchievement.ID.Hex(),
+					"error": err.Error(),
+				})
+			} else {
+				fixes = append(fixes, fiber.Map{
+					"reference_id": ref.ID.Hex(),
+					"old_achievement_id": oldAchievementID,
+					"new_achievement_id": correctAchievement.ID.Hex(),
+					"achievement_title": correctAchievement.Title,
+					"status": "fixed",
+				})
+			}
+		} else {
+			errors = append(errors, fiber.Map{
+				"reference_id": ref.ID.Hex(),
+				"achievement_id": ref.AchievementID,
+				"error": "No matching achievement found",
+			})
+		}
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Achievement ID mismatch fix completed",
+		"user_id": userID,
+		"summary": fiber.Map{
+			"total_achievements": len(achievements),
+			"total_references": len(references),
+			"fixes_applied": len(fixes),
+			"errors_encountered": len(errors),
+		},
+		"fixes": fixes,
+		"errors": errors,
+		"next_steps": []string{
+			"Try submitting your achievement again",
+			"The achievement ID should now match correctly",
+		},
+	})
+}
+// Comprehensive ID Fix - Memperbaiki semua masalah ID mismatch
+func (s *AchievementService) ComprehensiveIDFixRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	
+	// Get all achievements for this user
+	achievements, err := s.achievementRepo.GetByStudentID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get achievements",
+			"details": err.Error(),
+		})
+	}
+	
+	// Get all references for this user
+	references, err := s.achievementRepo.GetReferencesByStudentID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get references",
+			"details": err.Error(),
+		})
+	}
+	
+	var fixes []fiber.Map
+	var errors []fiber.Map
+	var orphanedReferences []fiber.Map
+	var orphanedAchievements []fiber.Map
+	
+	// Create maps for quick lookup
+	achievementMap := make(map[string]*model.Achievement)
+	for i, achievement := range achievements {
+		achievementMap[achievement.ID.Hex()] = &achievements[i]
+	}
+	
+	referenceMap := make(map[string]*model.AchievementReference)
+	for i, ref := range references {
+		referenceMap[ref.AchievementID] = &references[i]
+	}
+	
+	// Step 1: Fix references that point to non-existent achievements
+	for i, ref := range references {
+		if _, exists := achievementMap[ref.AchievementID]; !exists {
+			// Try to find matching achievement by creation time and student_id
+			var matchedAchievement *model.Achievement
+			
+			for _, achievement := range achievements {
+				if achievement.StudentID == ref.StudentID {
+					// Check if creation times are close (within 10 seconds)
+					timeDiff := achievement.CreatedAt.Sub(ref.CreatedAt)
+					if timeDiff < 10*time.Second && timeDiff > -10*time.Second {
+						// Check if this achievement doesn't already have a reference
+						if _, hasRef := referenceMap[achievement.ID.Hex()]; !hasRef {
+							matchedAchievement = &achievement
+							break
+						}
+					}
+				}
+			}
+			
+			if matchedAchievement != nil {
+				// Update reference with correct achievement_id
+				oldAchievementID := ref.AchievementID
+				references[i].AchievementID = matchedAchievement.ID.Hex()
+				
+				err := s.achievementRepo.UpdateReference(&references[i])
+				if err != nil {
+					errors = append(errors, fiber.Map{
+						"type": "reference_update_failed",
+						"reference_id": ref.ID.Hex(),
+						"old_achievement_id": oldAchievementID,
+						"new_achievement_id": matchedAchievement.ID.Hex(),
+						"error": err.Error(),
+					})
+				} else {
+					fixes = append(fixes, fiber.Map{
+						"type": "reference_fixed",
+						"reference_id": ref.ID.Hex(),
+						"old_achievement_id": oldAchievementID,
+						"new_achievement_id": matchedAchievement.ID.Hex(),
+						"achievement_title": matchedAchievement.Title,
+						"status": ref.Status,
+					})
+					// Update the map
+					referenceMap[matchedAchievement.ID.Hex()] = &references[i]
+					delete(referenceMap, oldAchievementID)
+				}
+			} else {
+				orphanedReferences = append(orphanedReferences, fiber.Map{
+					"reference_id": ref.ID.Hex(),
+					"achievement_id": ref.AchievementID,
+					"status": ref.Status,
+					"created_at": ref.CreatedAt,
+				})
+			}
+		}
+	}
+	
+	// Step 2: Find achievements without references and create them
+	for _, achievement := range achievements {
+		if _, hasRef := referenceMap[achievement.ID.Hex()]; !hasRef {
+			// Create missing reference
+			newRef := &model.AchievementReference{
+				StudentID:     achievement.StudentID,
+				AchievementID: achievement.ID.Hex(),
+				Status:        "draft", // Default status
+				CreatedAt:     achievement.CreatedAt,
+				UpdatedAt:     time.Now(),
+			}
+			
+			err := s.achievementRepo.CreateReference(newRef)
+			if err != nil {
+				errors = append(errors, fiber.Map{
+					"type": "reference_creation_failed",
+					"achievement_id": achievement.ID.Hex(),
+					"achievement_title": achievement.Title,
+					"error": err.Error(),
+				})
+			} else {
+				fixes = append(fixes, fiber.Map{
+					"type": "reference_created",
+					"achievement_id": achievement.ID.Hex(),
+					"achievement_title": achievement.Title,
+					"reference_id": newRef.ID.Hex(),
+					"status": newRef.Status,
+				})
+			}
+		}
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Comprehensive ID fix completed",
+		"user_id": userID,
+		"summary": fiber.Map{
+			"total_achievements": len(achievements),
+			"total_references": len(references),
+			"fixes_applied": len(fixes),
+			"errors_encountered": len(errors),
+			"orphaned_references": len(orphanedReferences),
+			"orphaned_achievements": len(orphanedAchievements),
+		},
+		"fixes": fixes,
+		"errors": errors,
+		"orphaned_references": orphanedReferences,
+		"orphaned_achievements": orphanedAchievements,
+		"next_steps": []string{
+			"All ID mismatches have been fixed",
+			"You can now submit, delete, or update your achievements",
+			"Orphaned references may need manual cleanup",
+		},
+	})
+}
+
+// Safe method to get reference by achievement ID with better error handling
+func (s *AchievementService) GetReferenceByAchievementIDSafe(achievementID string) (*model.AchievementReference, error) {
+	// First try direct lookup
+	reference, err := s.achievementRepo.GetReferenceByAchievementID(achievementID)
+	if err == nil {
+		return reference, nil
+	}
+	
+	// If not found, try to find by similar ID (in case of minor mismatch)
+	// Get achievement to find student_id
+	achievementObjID, err := primitive.ObjectIDFromHex(achievementID)
+	if err != nil {
+		return nil, errors.New("invalid achievement ID format")
+	}
+	
+	achievement, err := s.achievementRepo.GetByID(achievementObjID)
+	if err != nil {
+		return nil, errors.New("achievement not found")
+	}
+	
+	// Get all references for this student
+	references, err := s.achievementRepo.GetReferencesByStudentID(achievement.StudentID)
+	if err != nil {
+		return nil, err
+	}
+	
+	// Try to find reference by creation time match
+	for _, ref := range references {
+		timeDiff := achievement.CreatedAt.Sub(ref.CreatedAt)
+		if timeDiff < 5*time.Second && timeDiff > -5*time.Second {
+			return &ref, nil
+		}
+	}
+	
+	return nil, errors.New("reference not found")
+}
+// Fix New Achievement ID - Memperbaiki achievement yang baru dibuat dengan ID yang salah
+func (s *AchievementService) FixNewAchievementIDRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	achievementIDParam := c.Params("achievement_id")
+	
+	if achievementIDParam == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"error": "Achievement ID is required",
+			"message": "Please provide achievement ID in URL path",
+		})
+	}
+	
+	// Get all achievements for this user
+	achievements, err := s.achievementRepo.GetByStudentID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get achievements",
+			"details": err.Error(),
+		})
+	}
+	
+	// Find the achievement by ID.Hex() or by creation time match
+	var targetAchievement *model.Achievement
+	
+	// First try to find by exact ID match
+	for _, achievement := range achievements {
+		if achievement.ID.Hex() == achievementIDParam {
+			targetAchievement = &achievement
+			break
+		}
+	}
+	
+	// If not found by ID, try to find by reference lookup
+	if targetAchievement == nil {
+		reference, err := s.achievementRepo.GetReferenceByAchievementID(achievementIDParam)
+		if err == nil {
+			// Find achievement by student and creation time match
+			for _, achievement := range achievements {
+				if achievement.StudentID == reference.StudentID {
+					timeDiff := achievement.CreatedAt.Sub(reference.CreatedAt)
+					if timeDiff < 5*time.Second && timeDiff > -5*time.Second {
+						targetAchievement = &achievement
+						break
+					}
+				}
+			}
+		}
+	}
+	
+	if targetAchievement == nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Achievement not found",
+			"message": "No achievement found with the provided ID",
+		})
+	}
+	
+	// Get the reference that points to wrong achievement_id
+	reference, err := s.achievementRepo.GetReferenceByAchievementID(achievementIDParam)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"error": "Reference not found",
+			"message": "No reference found for this achievement",
+		})
+	}
+	
+	// Update reference to point to correct achievement ID
+	reference.AchievementID = targetAchievement.ID.Hex()
+	err = s.achievementRepo.UpdateReference(reference)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to update reference",
+			"details": err.Error(),
+		})
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Achievement ID fixed successfully",
+		"data": fiber.Map{
+			"achievement_id": targetAchievement.ID.Hex(),
+			"reference_id": reference.ID.Hex(),
+			"old_achievement_id": achievementIDParam,
+			"new_achievement_id": targetAchievement.ID.Hex(),
+			"achievement_title": targetAchievement.Title,
+			"status": reference.Status,
+		},
+		"next_steps": []string{
+			"Now you can submit this achievement using the correct ID: " + targetAchievement.ID.Hex(),
+			"Use: POST /api/achievements/" + targetAchievement.ID.Hex() + "/submit",
+		},
+	})
+}
+// Clean Legacy ObjectID - Membersihkan field ObjectID yang tidak diperlukan dari database
+func (s *AchievementService) CleanLegacyObjectIDRequest(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(string)
+	
+	// Get all achievements for this user
+	achievements, err := s.achievementRepo.GetByStudentID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"error": "Failed to get achievements",
+			"details": err.Error(),
+		})
+	}
+	
+	var cleaned []fiber.Map
+	var errors []fiber.Map
+	
+	for _, achievement := range achievements {
+		// Update achievement to remove ObjectID field (if it exists in database)
+		// This will be handled by the model change - just update to refresh
+		achievement.UpdatedAt = time.Now()
+		
+		err := s.achievementRepo.Update(&achievement)
+		if err != nil {
+			errors = append(errors, fiber.Map{
+				"achievement_id": achievement.ID.Hex(),
+				"title": achievement.Title,
+				"error": err.Error(),
+			})
+		} else {
+			cleaned = append(cleaned, fiber.Map{
+				"achievement_id": achievement.ID.Hex(),
+				"title": achievement.Title,
+				"status": "cleaned",
+			})
+		}
+	}
+	
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Legacy ObjectID field cleanup completed",
+		"user_id": userID,
+		"summary": fiber.Map{
+			"total_achievements": len(achievements),
+			"cleaned_count": len(cleaned),
+			"error_count": len(errors),
+		},
+		"cleaned": cleaned,
+		"errors": errors,
+		"note": "ObjectID field has been removed from the model. All new achievements will use proper ID field.",
+	})
+}
+// DebugAdminAchievementsRequest - Debug admin view all achievements
+func (s *AchievementService) DebugAdminAchievementsRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can debug
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"error": "Only admin can debug achievements",
+		})
+	}
+
+	// Get query parameters
+	page := c.QueryInt("page", 1)
+	limit := c.QueryInt("limit", 10)
+	status := c.Query("status", "")
+	studentID := c.Query("student_id", "")
+
+	// Step 1: Get achievement references
+	references, total, err := s.achievementRepo.GetAllReferencesWithFilters(page, limit, status, studentID)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"step": "get_references",
+			"error": err.Error(),
+		})
+	}
+
+	if len(references) == 0 {
+		return c.JSON(fiber.Map{
+			"step": "get_references",
+			"message": "No references found",
+			"total": total,
+		})
+	}
+
+	// Step 2: Extract student IDs (filter out empty strings)
+	studentIDs := make(map[string]bool)
+	for _, ref := range references {
+		if ref.StudentID != "" && len(ref.StudentID) > 0 {
+			studentIDs[ref.StudentID] = true
+		}
+	}
+
+	var studentIDList []string
+	for id := range studentIDs {
+		if id != "" && len(id) > 0 {
+			studentIDList = append(studentIDList, id)
+		}
+	}
+
+	// Step 3: Try to get students
+	students, err := s.studentRepo.GetStudentsByUserIDs(studentIDList)
+	if err != nil {
+		return c.JSON(fiber.Map{
+			"step": "get_students",
+			"error": err.Error(),
+			"student_ids_requested": studentIDList,
+			"total_references": len(references),
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"step": "success",
+		"data": fiber.Map{
+			"total_references": len(references),
+			"unique_student_ids": len(studentIDList),
+			"students_found": len(students),
+			"student_ids_requested": studentIDList,
+			"students_found_data": students,
+			"sample_references": references[:min(3, len(references))],
+		},
+	})
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }

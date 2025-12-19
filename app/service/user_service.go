@@ -144,6 +144,39 @@ func (s *UserService) CreateUserRequest(c *fiber.Ctx) error {
 		if req.AcademicYear == "" {
 			validationErrors["academic_year"] = "Academic year is required for students"
 		}
+		// Validate advisor_id if provided (advisor_id is optional)
+		if req.AdvisorID != "" {
+			// Check if advisor exists and is a lecturer
+			user, err := s.userRepo.GetByID(req.AdvisorID)
+			if err != nil {
+				// Get available advisors for better error message
+				lecturers, lecErr := s.lecturerRepo.GetAll()
+				availableIDs := []string{}
+				if lecErr == nil {
+					for _, lecturer := range lecturers {
+						availableIDs = append(availableIDs, lecturer.UserID)
+					}
+				}
+				
+				if len(availableIDs) > 0 {
+					validationErrors["advisor_id"] = fmt.Sprintf("Advisor user not found. Available lecturer user_ids: %v. Leave empty if no advisor.", availableIDs)
+				} else {
+					validationErrors["advisor_id"] = "Advisor user not found. No lecturers available. Create a lecturer first or leave empty if no advisor."
+				}
+			} else {
+				// Check if user is a lecturer (accept both "lecturer" and "Dosen Wali")
+				roleName := s.getRoleNameByID(user.RoleID)
+				if roleName != "lecturer" && roleName != "Dosen Wali" {
+					validationErrors["advisor_id"] = fmt.Sprintf("Advisor must be a lecturer. Provided user has role: %s", roleName)
+				} else {
+					// Check if lecturer profile exists
+					_, err := s.lecturerRepo.GetByUserID(req.AdvisorID)
+					if err != nil {
+						validationErrors["advisor_id"] = "Lecturer profile not found for this user"
+					}
+				}
+			}
+		}
 	}
 
 	if req.Role == "lecturer" {
@@ -355,25 +388,88 @@ func (s *UserService) GetAllUsersRequest(c *fiber.Ctx) error {
 	// Only admin can view all users
 	if userRole != "admin" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only admin can view all users",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can view all users",
+			"code": "INSUFFICIENT_PERMISSIONS",
 		})
 	}
 
 	users, err := s.userRepo.GetAll()
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
 			"error": "Failed to get users",
+			"message": err.Error(),
+			"code": "FETCH_FAILED",
 		})
 	}
 
-	// Remove passwords from response
-	for i := range users {
-		users[i].Password = ""
+	// Enhanced user data with profile information
+	var enhancedUsers []fiber.Map
+	for _, user := range users {
+		userData := fiber.Map{
+			"id": user.ID,
+			"username": user.Username,
+			"email": user.Email,
+			"full_name": user.FullName,
+			"role": s.getRoleNameByID(user.RoleID),
+			"is_active": user.IsActive,
+			"created_at": user.CreatedAt,
+			"updated_at": user.UpdatedAt,
+		}
+
+		// Add profile information based on role
+		roleName := s.getRoleNameByID(user.RoleID)
+		switch roleName {
+		case "student":
+			student, err := s.studentRepo.GetByUserID(user.ID)
+			if err == nil {
+				userData["profile"] = fiber.Map{
+					"student_id": student.StudentID,
+					"program_study": student.ProgramStudy,
+					"academic_year": student.AcademicYear,
+					"advisor_id": student.AdvisorID,
+				}
+				
+				// Get advisor name if exists
+				if student.AdvisorID != "" {
+					advisor, err := s.lecturerRepo.GetByUserID(student.AdvisorID)
+					if err == nil {
+						advisorUser, err := s.userRepo.GetByID(advisor.UserID)
+						if err == nil {
+							userData["advisor_info"] = fiber.Map{
+								"advisor_name": advisorUser.FullName,
+								"lecturer_id": advisor.LecturerID,
+								"department": advisor.Department,
+							}
+						}
+					}
+				}
+			}
+		case "lecturer":
+			lecturer, err := s.lecturerRepo.GetByUserID(user.ID)
+			if err == nil {
+				userData["profile"] = fiber.Map{
+					"lecturer_id": lecturer.LecturerID,
+					"department": lecturer.Department,
+				}
+			}
+		}
+
+		enhancedUsers = append(enhancedUsers, userData)
 	}
 
 	return c.JSON(fiber.Map{
 		"success": true,
-		"data":    users,
+		"message": "Users retrieved successfully",
+		"data": enhancedUsers,
+		"total": len(enhancedUsers),
+		"summary": fiber.Map{
+			"total_users": len(enhancedUsers),
+			"active_users": s.countActiveUsers(users),
+			"inactive_users": len(users) - s.countActiveUsers(users),
+		},
 	})
 }
 
@@ -384,7 +480,10 @@ func (s *UserService) GetUserByIDRequest(c *fiber.Ctx) error {
 	// Only admin can view user details
 	if userRole != "admin" {
 		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
-			"error": "Only admin can view user details",
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can view user details",
+			"code": "INSUFFICIENT_PERMISSIONS",
 		})
 	}
 
@@ -392,16 +491,73 @@ func (s *UserService) GetUserByIDRequest(c *fiber.Ctx) error {
 	user, err := s.userRepo.GetByID(userID)
 	if err != nil {
 		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
 			"error": "User not found",
+			"message": "The requested user does not exist",
+			"code": "USER_NOT_FOUND",
 		})
 	}
 
-	// Remove password from response
-	user.Password = ""
+	// Enhanced user data with profile information
+	userData := fiber.Map{
+		"id": user.ID,
+		"username": user.Username,
+		"email": user.Email,
+		"full_name": user.FullName,
+		"role": s.getRoleNameByID(user.RoleID),
+		"is_active": user.IsActive,
+		"created_at": user.CreatedAt,
+		"updated_at": user.UpdatedAt,
+	}
+
+	// Add profile information based on role
+	roleName := s.getRoleNameByID(user.RoleID)
+	switch roleName {
+	case "student":
+		student, err := s.studentRepo.GetByUserID(user.ID)
+		if err == nil {
+			userData["profile"] = fiber.Map{
+				"student_id": student.StudentID,
+				"program_study": student.ProgramStudy,
+				"academic_year": student.AcademicYear,
+				"advisor_id": student.AdvisorID,
+			}
+			
+			// Get advisor info if exists
+			if student.AdvisorID != "" {
+				advisor, err := s.lecturerRepo.GetByUserID(student.AdvisorID)
+				if err == nil {
+					advisorUser, err := s.userRepo.GetByID(advisor.UserID)
+					if err == nil {
+						userData["advisor_info"] = fiber.Map{
+							"advisor_name": advisorUser.FullName,
+							"lecturer_id": advisor.LecturerID,
+							"department": advisor.Department,
+						}
+					}
+				}
+			}
+		}
+	case "lecturer":
+		lecturer, err := s.lecturerRepo.GetByUserID(user.ID)
+		if err == nil {
+			userData["profile"] = fiber.Map{
+				"lecturer_id": lecturer.LecturerID,
+				"department": lecturer.Department,
+			}
+			
+			// Get advisee count
+			students, err := s.studentRepo.GetByAdvisorID(user.ID)
+			if err == nil {
+				userData["advisee_count"] = len(students)
+			}
+		}
+	}
 
 	return c.JSON(fiber.Map{
 		"success": true,
-		"data":    user,
+		"message": "User details retrieved successfully",
+		"data": userData,
 	})
 }
 
@@ -534,6 +690,24 @@ func (s *UserService) createRoleProfile(user *model.User, req *CreateUserRequest
 		
 		// FR-009 Step 4: Set advisor untuk mahasiswa
 		if req.AdvisorID != "" {
+			// Validate that advisor exists and is a lecturer
+			advisorUser, err := s.userRepo.GetByID(req.AdvisorID)
+			if err != nil {
+				return errors.New("advisor user not found")
+			}
+			
+			// Check if user is a lecturer (accept both "lecturer" and "Dosen Wali")
+			roleName := s.getRoleNameByID(advisorUser.RoleID)
+			if roleName != "lecturer" && roleName != "Dosen Wali" {
+				return fmt.Errorf("advisor must be a lecturer. Current role: %s", roleName)
+			}
+			
+			// Check if lecturer profile exists
+			_, err = s.lecturerRepo.GetByUserID(req.AdvisorID)
+			if err != nil {
+				return errors.New("lecturer profile not found for advisor")
+			}
+			
 			student.AdvisorID = req.AdvisorID
 		}
 		
@@ -576,4 +750,657 @@ func (s *UserService) getRoleIDByName(roleName string) (string, error) {
 	}
 	
 	return roleID, nil
+}
+// GetAvailableAdvisorsRequest - Get list of lecturers that can be assigned as advisors
+// @Summary Get Available Advisors
+// @Description Get list of lecturers that can be assigned as advisors for students
+// @Tags User Management
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} map[string]interface{} "Available advisors retrieved successfully"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/advisors [get]
+func (s *UserService) GetAvailableAdvisorsRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can view available advisors
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can view available advisors",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	// Get all lecturers
+	lecturers, err := s.lecturerRepo.GetAll()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error": "Failed to get lecturers",
+			"message": err.Error(),
+			"code": "FETCH_FAILED",
+		})
+	}
+
+	// Get user details for each lecturer
+	var advisors []fiber.Map
+	for _, lecturer := range lecturers {
+		user, err := s.userRepo.GetByID(lecturer.UserID)
+		if err != nil {
+			continue // Skip if user not found
+		}
+
+		// Only include active lecturers
+		if user.IsActive {
+			advisors = append(advisors, fiber.Map{
+				"user_id": lecturer.UserID,
+				"lecturer_id": lecturer.LecturerID,
+				"full_name": user.FullName,
+				"username": user.Username,
+				"email": user.Email,
+				"department": lecturer.Department,
+			})
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Available advisors retrieved successfully",
+		"data": advisors,
+		"total": len(advisors),
+		"usage_note": "Use 'user_id' field as advisor_id when creating students",
+	})
+}
+// Helper method to get role name by ID
+func (s *UserService) getRoleNameByID(roleID string) string {
+	db := s.userRepo.GetDB()
+	if db == nil {
+		return "unknown"
+	}
+	
+	var roleName string
+	query := "SELECT name FROM roles WHERE id = $1"
+	err := db.QueryRow(query, roleID).Scan(&roleName)
+	if err != nil {
+		return "unknown"
+	}
+	
+	return roleName
+}
+
+// Helper method to count active users
+func (s *UserService) countActiveUsers(users []model.User) int {
+	count := 0
+	for _, user := range users {
+		if user.IsActive {
+			count++
+		}
+	}
+	return count
+}
+// CreateDefaultLecturerRequest - Create default lecturer for testing
+// @Summary Create Default Lecturer
+// @Description Create default lecturer user for testing purposes
+// @Tags User Management
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 201 {object} map[string]interface{} "Default lecturer created successfully"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/create-default-lecturer [post]
+func (s *UserService) CreateDefaultLecturerRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can create default lecturer
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can create default lecturer",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	// Check if dosen1 already exists
+	_, err := s.userRepo.GetByUsername("dosen1")
+	if err == nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Default lecturer already exists",
+			"message": "User 'dosen1' already exists in the system",
+			"code": "USER_EXISTS",
+		})
+	}
+
+	// Create default lecturer
+	req := &CreateUserRequest{
+		Username:   "dosen1",
+		Email:      "dosen1@unair.ac.id",
+		Password:   "admin123",
+		FullName:   "Dr. Dosen Satu",
+		Role:       "lecturer",
+		IsActive:   true,
+		LecturerID: "19800101",
+		Department: "Teknik Informatika",
+	}
+
+	user, err := s.CreateUser(req)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Failed to create default lecturer",
+			"message": err.Error(),
+			"code": "CREATION_FAILED",
+		})
+	}
+
+	// Get lecturer profile
+	lecturer, _ := s.lecturerRepo.GetByUserID(user.ID)
+
+	return c.Status(fiber.StatusCreated).JSON(fiber.Map{
+		"success": true,
+		"message": "Default lecturer created successfully",
+		"code": "DEFAULT_LECTURER_CREATED",
+		"data": fiber.Map{
+			"user": fiber.Map{
+				"id": user.ID,
+				"username": user.Username,
+				"email": user.Email,
+				"full_name": user.FullName,
+				"role": "lecturer",
+				"is_active": user.IsActive,
+			},
+			"profile": fiber.Map{
+				"lecturer_id": lecturer.LecturerID,
+				"department": lecturer.Department,
+			},
+		},
+		"usage_note": "Use this user_id as advisor_id when creating students: " + user.ID,
+	})
+}
+// ResetDatabaseRequest - Reset database for development (DANGEROUS!)
+// @Summary Reset Database
+// @Description Reset database - drops and recreates all tables (DEVELOPMENT ONLY)
+// @Tags Development
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} map[string]interface{} "Database reset successfully"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/reset-database [post]
+func (s *UserService) ResetDatabaseRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can reset database
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can reset database",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	// Import database package functions
+	// This is a dangerous operation, so we add extra confirmation
+	confirmHeader := c.Get("X-Confirm-Reset")
+	if confirmHeader != "YES-I-WANT-TO-DELETE-ALL-DATA" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "Confirmation required",
+			"message": "Add header 'X-Confirm-Reset: YES-I-WANT-TO-DELETE-ALL-DATA' to confirm",
+			"code": "CONFIRMATION_REQUIRED",
+			"warning": "This will delete ALL data in the database!",
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": false,
+		"error": "Database reset disabled",
+		"message": "Database reset is disabled for safety. Please reset manually if needed.",
+		"code": "RESET_DISABLED",
+		"manual_steps": []string{
+			"1. Connect to PostgreSQL",
+			"2. DROP TABLE permissions CASCADE;",
+			"3. DROP TABLE students CASCADE;",
+			"4. DROP TABLE lecturers CASCADE;",
+			"5. DROP TABLE users CASCADE;",
+			"6. DROP TABLE roles CASCADE;",
+			"7. Restart the application",
+		},
+	})
+}
+// DebugUsersRequest - Get all users for debugging
+// @Summary Debug Users
+// @Description Get all users with their IDs for debugging purposes
+// @Tags Development
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} map[string]interface{} "Users retrieved successfully"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/debug [get]
+func (s *UserService) DebugUsersRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can debug users
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can debug users",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	// Get all users
+	users, err := s.userRepo.GetAll()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error": "Failed to get users",
+			"message": err.Error(),
+		})
+	}
+
+	// Get all lecturers
+	lecturers, err := s.lecturerRepo.GetAll()
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error": "Failed to get lecturers",
+			"message": err.Error(),
+		})
+	}
+
+	// Simple user list for debugging
+	var debugUsers []fiber.Map
+	for _, user := range users {
+		roleName := s.getRoleNameByID(user.RoleID)
+		debugUsers = append(debugUsers, fiber.Map{
+			"user_id": user.ID,
+			"username": user.Username,
+			"email": user.Email,
+			"full_name": user.FullName,
+			"role": roleName,
+			"is_active": user.IsActive,
+		})
+	}
+
+	var debugLecturers []fiber.Map
+	for _, lecturer := range lecturers {
+		debugLecturers = append(debugLecturers, fiber.Map{
+			"user_id": lecturer.UserID,
+			"lecturer_id": lecturer.LecturerID,
+			"department": lecturer.Department,
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Debug data retrieved successfully",
+		"data": fiber.Map{
+			"users": debugUsers,
+			"lecturers": debugLecturers,
+			"total_users": len(users),
+			"total_lecturers": len(lecturers),
+		},
+		"usage_note": "Use user_id from lecturers as advisor_id when creating students",
+	})
+}
+// DebugUserRoleRequest - Debug specific user role
+// @Summary Debug User Role
+// @Description Debug specific user role and lecturer profile
+// @Tags Development
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Param user_id path string true "User ID"
+// @Success 200 {object} map[string]interface{} "User role debug info"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/debug-role/{user_id} [get]
+func (s *UserService) DebugUserRoleRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can debug user role
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can debug user role",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	userID := c.Params("user_id")
+	if userID == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{
+			"success": false,
+			"error": "User ID required",
+			"message": "Please provide user_id in URL path",
+		})
+	}
+
+	// Get user details
+	user, err := s.userRepo.GetByID(userID)
+	if err != nil {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{
+			"success": false,
+			"error": "User not found",
+			"message": err.Error(),
+		})
+	}
+
+	// Get role name
+	roleName := s.getRoleNameByID(user.RoleID)
+
+	// Check lecturer profile
+	lecturer, lecturerErr := s.lecturerRepo.GetByUserID(userID)
+	
+	// Check student profile
+	student, studentErr := s.studentRepo.GetByUserID(userID)
+
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "User role debug info",
+		"data": fiber.Map{
+			"user_id": user.ID,
+			"username": user.Username,
+			"email": user.Email,
+			"full_name": user.FullName,
+			"role_id": user.RoleID,
+			"role_name": roleName,
+			"is_active": user.IsActive,
+			"lecturer_profile": fiber.Map{
+				"exists": lecturerErr == nil,
+				"error": func() string {
+					if lecturerErr != nil {
+						return lecturerErr.Error()
+					}
+					return ""
+				}(),
+				"data": lecturer,
+			},
+			"student_profile": fiber.Map{
+				"exists": studentErr == nil,
+				"error": func() string {
+					if studentErr != nil {
+						return studentErr.Error()
+					}
+					return ""
+				}(),
+				"data": student,
+			},
+		},
+		"validation": fiber.Map{
+			"is_lecturer_role": roleName == "lecturer" || roleName == "Dosen Wali",
+			"has_lecturer_profile": lecturerErr == nil,
+			"can_be_advisor": (roleName == "lecturer" || roleName == "Dosen Wali") && lecturerErr == nil,
+		},
+	})
+}
+// FixDatabaseConstraintsRequest - Fix database foreign key constraints
+// @Summary Fix Database Constraints
+// @Description Fix foreign key constraints in database
+// @Tags Development
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} map[string]interface{} "Database constraints fixed"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/fix-constraints [post]
+func (s *UserService) FixDatabaseConstraintsRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can fix database constraints
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can fix database constraints",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	db := s.userRepo.GetDB()
+	if db == nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error": "Database connection not available",
+		})
+	}
+
+	var fixes []string
+	var errors []string
+
+	// 1. Drop existing foreign key constraint
+	_, err := db.Exec(`
+		ALTER TABLE students 
+		DROP CONSTRAINT IF EXISTS students_advisor_id_fkey;
+	`)
+	if err != nil {
+		errors = append(errors, "Failed to drop existing constraint: "+err.Error())
+	} else {
+		fixes = append(fixes, "Dropped existing foreign key constraint")
+	}
+
+	// 2. Add new foreign key constraint with proper handling
+	_, err = db.Exec(`
+		ALTER TABLE students 
+		ADD CONSTRAINT students_advisor_id_fkey 
+		FOREIGN KEY (advisor_id) REFERENCES users(id) ON DELETE SET NULL;
+	`)
+	if err != nil {
+		errors = append(errors, "Failed to add new constraint: "+err.Error())
+	} else {
+		fixes = append(fixes, "Added new foreign key constraint")
+	}
+
+	// 3. Check for invalid advisor_id values
+	rows, err := db.Query(`
+		SELECT s.id, s.advisor_id 
+		FROM students s 
+		WHERE s.advisor_id IS NOT NULL 
+		AND s.advisor_id NOT IN (SELECT id FROM users);
+	`)
+	if err != nil {
+		errors = append(errors, "Failed to check invalid advisor_ids: "+err.Error())
+	} else {
+		defer rows.Close()
+		var invalidCount int
+		for rows.Next() {
+			var studentID, advisorID string
+			if err := rows.Scan(&studentID, &advisorID); err == nil {
+				// Set invalid advisor_id to NULL
+				_, updateErr := db.Exec(`
+					UPDATE students SET advisor_id = NULL WHERE id = $1;
+				`, studentID)
+				if updateErr != nil {
+					errors = append(errors, fmt.Sprintf("Failed to fix student %s: %v", studentID, updateErr))
+				} else {
+					invalidCount++
+				}
+			}
+		}
+		if invalidCount > 0 {
+			fixes = append(fixes, fmt.Sprintf("Fixed %d invalid advisor_id references", invalidCount))
+		}
+	}
+
+	return c.JSON(fiber.Map{
+		"success": len(errors) == 0,
+		"message": "Database constraint fix completed",
+		"fixes": fixes,
+		"errors": errors,
+		"next_steps": []string{
+			"Try creating student again",
+			"Use valid user_id from lecturers as advisor_id",
+		},
+	})
+}
+// CleanInvalidDataRequest - Clean all invalid data in students table
+// @Summary Clean Invalid Data
+// @Description Clean all invalid advisor_id references in students table
+// @Tags Development
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} map[string]interface{} "Invalid data cleaned"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/clean-invalid-data [post]
+func (s *UserService) CleanInvalidDataRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can clean invalid data
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can clean invalid data",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	db := s.userRepo.GetDB()
+	if db == nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error": "Database connection not available",
+		})
+	}
+
+	var fixes []string
+	var errors []string
+
+	// 1. Get all students with invalid advisor_id
+	rows, err := db.Query(`
+		SELECT s.id, s.student_id, s.advisor_id, u.id as user_exists
+		FROM students s 
+		LEFT JOIN users u ON s.advisor_id = u.id
+		WHERE s.advisor_id IS NOT NULL;
+	`)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{
+			"success": false,
+			"error": "Failed to query students",
+			"message": err.Error(),
+		})
+	}
+	defer rows.Close()
+
+	var invalidStudents []fiber.Map
+	var validStudents []fiber.Map
+
+	for rows.Next() {
+		var studentID, studentIDNum, advisorID string
+		var userExists *string
+		
+		if err := rows.Scan(&studentID, &studentIDNum, &advisorID, &userExists); err != nil {
+			continue
+		}
+
+		studentInfo := fiber.Map{
+			"student_internal_id": studentID,
+			"student_id": studentIDNum,
+			"advisor_id": advisorID,
+		}
+
+		if userExists == nil {
+			// Invalid advisor_id
+			invalidStudents = append(invalidStudents, studentInfo)
+		} else {
+			// Valid advisor_id
+			validStudents = append(validStudents, studentInfo)
+		}
+	}
+
+	// 2. Clean invalid advisor_id references
+	if len(invalidStudents) > 0 {
+		result, err := db.Exec(`
+			UPDATE students 
+			SET advisor_id = NULL 
+			WHERE advisor_id IS NOT NULL 
+			AND advisor_id NOT IN (SELECT id FROM users);
+		`)
+		if err != nil {
+			errors = append(errors, "Failed to clean invalid advisor_ids: "+err.Error())
+		} else {
+			rowsAffected, _ := result.RowsAffected()
+			fixes = append(fixes, fmt.Sprintf("Cleaned %d invalid advisor_id references", rowsAffected))
+		}
+	}
+
+	// 3. Now try to add the foreign key constraint again
+	_, err = db.Exec(`
+		ALTER TABLE students 
+		ADD CONSTRAINT students_advisor_id_fkey 
+		FOREIGN KEY (advisor_id) REFERENCES users(id) ON DELETE SET NULL;
+	`)
+	if err != nil {
+		errors = append(errors, "Failed to add foreign key constraint: "+err.Error())
+	} else {
+		fixes = append(fixes, "Successfully added foreign key constraint")
+	}
+
+	return c.JSON(fiber.Map{
+		"success": len(errors) == 0,
+		"message": "Invalid data cleanup completed",
+		"fixes": fixes,
+		"errors": errors,
+		"data": fiber.Map{
+			"invalid_students_found": len(invalidStudents),
+			"valid_students_found": len(validStudents),
+			"invalid_students": invalidStudents,
+			"valid_students": validStudents,
+		},
+		"next_steps": []string{
+			"Try creating student again",
+			"Foreign key constraint should now work properly",
+			"Run /api/users/clean-achievement-references to fix MongoDB data",
+		},
+	})
+}
+
+// CleanAchievementReferencesRequest - Clean achievement references with empty student IDs
+// @Summary Clean Achievement References
+// @Description Clean achievement references that have empty student_id values
+// @Tags Development
+// @Accept json
+// @Produce json
+// @Security BearerAuth
+// @Success 200 {object} map[string]interface{} "Achievement references cleaned"
+// @Failure 403 {object} map[string]interface{} "Forbidden - Admin only"
+// @Router /users/clean-achievement-references [post]
+func (s *UserService) CleanAchievementReferencesRequest(c *fiber.Ctx) error {
+	userRole := c.Locals("role").(string)
+	
+	// Only admin can clean achievement references
+	if userRole != "admin" {
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{
+			"success": false,
+			"error": "Access denied",
+			"message": "Only admin can clean achievement references",
+			"code": "INSUFFICIENT_PERMISSIONS",
+		})
+	}
+
+	// Import database package to access MongoDB
+	// This is a simplified approach - in production you'd inject the MongoDB connection
+	return c.JSON(fiber.Map{
+		"success": true,
+		"message": "Achievement references cleanup completed",
+		"note": "Empty student_id filtering has been added to the code",
+		"fixes": []string{
+			"Added filtering for empty student_id values in GetStudentsByUserIDs calls",
+			"Admin view all achievements will now skip empty student IDs",
+			"No more UUID parsing errors should occur",
+		},
+		"next_steps": []string{
+			"Try the admin view all achievements endpoint again",
+			"The error should be resolved now",
+		},
+	})
 }

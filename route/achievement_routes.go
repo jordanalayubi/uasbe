@@ -39,6 +39,10 @@ func SetupAchievementRoutes(app *fiber.App, achievementService *service.Achievem
 		middleware.PermissionMiddleware(authService, "achievements", "view_advisee"),
 		achievementService.GetAdviseeAchievementsRequest)
 
+	// FR-011: Achievement Statistics - Must be BEFORE /:id route
+	api.Get("/statistics", 
+		achievementService.GetAchievementStatisticsRequest)
+
 	api.Get("/:id", 
 		middleware.PermissionMiddleware(authService, "achievements", "read"),
 		achievementService.GetAchievementByIDRequest)
@@ -90,23 +94,20 @@ func SetupAchievementRoutes(app *fiber.App, achievementService *service.Achievem
 		middleware.AdminOnlyMiddleware(),
 		achievementService.GetAllAchievementsRequest)
 
-	// FR-011: Achievement Statistics - Role-based statistics
-	stats := api.Group("/statistics")
-	
-	// FR-011: Get achievement statistics based on user role
-	// - Student: own statistics
-	// - Lecturer: advisee statistics  
-	// - Admin: all statistics
-	stats.Get("/", 
-		achievementService.GetAchievementStatisticsRequest)
+	// FR-011: Achievement Statistics moved above to avoid route conflict
 
 	// Debug endpoint - temporary for troubleshooting
 	api.Get("/debug/data", achievementService.DebugDataRequest)
 	api.Post("/debug/fix", achievementService.FixDataMismatchesRequest)
+	api.Post("/debug/fix-id-mismatch", achievementService.FixAchievementIDMismatchRequest)
+	api.Post("/debug/fix-comprehensive", achievementService.ComprehensiveIDFixRequest)
+	api.Post("/debug/fix-new/:achievement_id", achievementService.FixNewAchievementIDRequest)
+	api.Post("/debug/clean-legacy", achievementService.CleanLegacyObjectIDRequest)
 	api.Get("/debug/advisor", achievementService.DebugAdvisorRequest)
 	api.Post("/debug/fix-advisor", achievementService.FixAdvisorRelationshipRequest)
 	api.Post("/debug/assign-student", achievementService.AssignStudentToLecturerRequest)
 	api.Get("/debug/all-data", achievementService.DebugAllDataRequest)
 	api.Get("/debug/submitted", achievementService.GetAllSubmittedAchievementsRequest)
 	api.Get("/debug/advisor-lookup", achievementService.DebugGetByAdvisorIDRequest)
+	api.Get("/debug/admin-achievements", achievementService.DebugAdminAchievementsRequest)
 }

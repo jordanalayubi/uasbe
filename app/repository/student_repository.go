@@ -40,14 +40,27 @@ func (r *StudentRepository) GetByID(id string) (*model.Student, error) {
 	var student model.Student
 	
 	query := `
-		SELECT id, user_id, student_id, program_study, academic_year, advisor_id, created_at
+		SELECT id, user_id, student_id, program_study, academic_year, 
+		       advisor_id, created_at
 		FROM students WHERE id = $1
 	`
 	
+	var advisorID sql.NullString
 	err := r.db.QueryRow(query, id).Scan(
 		&student.ID, &student.UserID, &student.StudentID, &student.ProgramStudy,
-		&student.AcademicYear, &student.AdvisorID, &student.CreatedAt,
+		&student.AcademicYear, &advisorID, &student.CreatedAt,
 	)
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	// Handle NULL advisor_id properly
+	if advisorID.Valid {
+		student.AdvisorID = advisorID.String
+	} else {
+		student.AdvisorID = ""
+	}
 	
 	if err != nil {
 		return nil, err
@@ -60,14 +73,27 @@ func (r *StudentRepository) GetByUserID(userID string) (*model.Student, error) {
 	var student model.Student
 	
 	query := `
-		SELECT id, user_id, student_id, program_study, academic_year, advisor_id, created_at
+		SELECT id, user_id, student_id, program_study, academic_year, 
+		       advisor_id, created_at
 		FROM students WHERE user_id = $1
 	`
 	
+	var advisorID sql.NullString
 	err := r.db.QueryRow(query, userID).Scan(
 		&student.ID, &student.UserID, &student.StudentID, &student.ProgramStudy,
-		&student.AcademicYear, &student.AdvisorID, &student.CreatedAt,
+		&student.AcademicYear, &advisorID, &student.CreatedAt,
 	)
+	
+	if err != nil {
+		return nil, err
+	}
+	
+	// Handle NULL advisor_id properly
+	if advisorID.Valid {
+		student.AdvisorID = advisorID.String
+	} else {
+		student.AdvisorID = ""
+	}
 	
 	if err != nil {
 		return nil, err
@@ -84,13 +110,21 @@ func (r *StudentRepository) GetByStudentID(studentID string) (*model.Student, er
 		FROM students WHERE student_id = $1
 	`
 	
+	var advisorID sql.NullString
 	err := r.db.QueryRow(query, studentID).Scan(
 		&student.ID, &student.UserID, &student.StudentID, &student.ProgramStudy,
-		&student.AcademicYear, &student.AdvisorID, &student.CreatedAt,
+		&student.AcademicYear, &advisorID, &student.CreatedAt,
 	)
 	
 	if err != nil {
 		return nil, err
+	}
+	
+	// Handle NULL advisor_id properly
+	if advisorID.Valid {
+		student.AdvisorID = advisorID.String
+	} else {
+		student.AdvisorID = ""
 	}
 	
 	return &student, nil
@@ -161,13 +195,23 @@ func (r *StudentRepository) GetAll() ([]model.Student, error) {
 	
 	for rows.Next() {
 		var student model.Student
+		var advisorID sql.NullString
+		
 		err := rows.Scan(
 			&student.ID, &student.UserID, &student.StudentID, &student.ProgramStudy,
-			&student.AcademicYear, &student.AdvisorID, &student.CreatedAt,
+			&student.AcademicYear, &advisorID, &student.CreatedAt,
 		)
 		if err != nil {
 			return nil, err
 		}
+		
+		// Handle NULL advisor_id properly
+		if advisorID.Valid {
+			student.AdvisorID = advisorID.String
+		} else {
+			student.AdvisorID = ""
+		}
+		
 		students = append(students, student)
 	}
 	
@@ -181,16 +225,29 @@ func (r *StudentRepository) GetStudentsByUserIDs(userIDs []string) ([]model.Stud
 		return students, nil
 	}
 	
+	// Filter out empty strings to avoid UUID parsing errors
+	var validUserIDs []string
+	for _, id := range userIDs {
+		if id != "" && len(id) > 0 {
+			validUserIDs = append(validUserIDs, id)
+		}
+	}
+	
+	if len(validUserIDs) == 0 {
+		return students, nil
+	}
+	
 	// Create placeholders for IN clause
-	placeholders := make([]string, len(userIDs))
-	args := make([]interface{}, len(userIDs))
-	for i, id := range userIDs {
+	placeholders := make([]string, len(validUserIDs))
+	args := make([]interface{}, len(validUserIDs))
+	for i, id := range validUserIDs {
 		placeholders[i] = fmt.Sprintf("$%d", i+1)
 		args[i] = id
 	}
 	
 	query := fmt.Sprintf(`
-		SELECT id, user_id, student_id, program_study, academic_year, advisor_id, created_at
+		SELECT id, user_id, student_id, program_study, academic_year, 
+		       advisor_id, created_at
 		FROM students WHERE user_id IN (%s)
 		ORDER BY created_at DESC
 	`, strings.Join(placeholders, ","))
@@ -203,13 +260,23 @@ func (r *StudentRepository) GetStudentsByUserIDs(userIDs []string) ([]model.Stud
 	
 	for rows.Next() {
 		var student model.Student
+		var advisorID sql.NullString
+		
 		err := rows.Scan(
 			&student.ID, &student.UserID, &student.StudentID, &student.ProgramStudy,
-			&student.AcademicYear, &student.AdvisorID, &student.CreatedAt,
+			&student.AcademicYear, &advisorID, &student.CreatedAt,
 		)
 		if err != nil {
 			return nil, err
 		}
+		
+		// Handle NULL advisor_id properly
+		if advisorID.Valid {
+			student.AdvisorID = advisorID.String
+		} else {
+			student.AdvisorID = ""
+		}
+		
 		students = append(students, student)
 	}
 	

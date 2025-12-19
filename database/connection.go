@@ -47,6 +47,28 @@ func Connect() {
 	// Connect to PostgreSQL
 	connectPostgreSQL()
 	
+	// Check database health first
+	err := CheckDatabaseHealth()
+	if err != nil {
+		log.Printf("Database health check failed: %v", err)
+		log.Println("Attempting to setup database schema...")
+		
+		// Setup database schema
+		err = SetupSchema()
+		if err != nil {
+			log.Printf("Failed to setup database schema: %v", err)
+			log.Println("Please reset database manually or check the error above")
+			log.Fatal("Database setup failed")
+		}
+	}
+	
+	// Create default users
+	err = CreateDefaultUsers()
+	if err != nil {
+		log.Printf("Warning: Failed to create default users: %v", err)
+		log.Println("You may need to create admin user manually")
+	}
+	
 	// Connect to MongoDB
 	connectMongoDB()
 }
@@ -342,5 +364,275 @@ func (m *MongoMigrator) runMigration(filename string) error {
 	}
 
 	log.Printf("Migration %s marked as executed", filename)
+	return nil
+}
+// SetupSchema creates database tables if they don't exist
+func SetupSchema() error {
+	// Create roles table
+	_, err := PostgresDB.Exec(`
+		CREATE TABLE IF NOT EXISTS roles (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			name VARCHAR(50) UNIQUE NOT NULL,
+			description TEXT,
+			created_at TIMESTAMP DEFAULT NOW(),
+			updated_at TIMESTAMP DEFAULT NOW()
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create roles table: %v", err)
+	}
+
+	// Insert default roles
+	_, err = PostgresDB.Exec(`
+		INSERT INTO roles (name, description) VALUES 
+		('admin', 'System Administrator'),
+		('student', 'Student User'),
+		('lecturer', 'Lecturer User')
+		ON CONFLICT (name) DO NOTHING;
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to insert default roles: %v", err)
+	}
+
+	// Create users table
+	_, err = PostgresDB.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			username VARCHAR(100) UNIQUE NOT NULL,
+			email VARCHAR(255) UNIQUE NOT NULL,
+			password VARCHAR(255) NOT NULL,
+			full_name VARCHAR(255) NOT NULL,
+			role_id UUID NOT NULL REFERENCES roles(id),
+			is_active BOOLEAN DEFAULT true,
+			created_at TIMESTAMP DEFAULT NOW(),
+			updated_at TIMESTAMP DEFAULT NOW()
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create users table: %v", err)
+	}
+
+	// Create lecturers table
+	_, err = PostgresDB.Exec(`
+		CREATE TABLE IF NOT EXISTS lecturers (
+			id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			lecturer_id VARCHAR(50) UNIQUE NOT NULL,
+			department VARCHAR(255) NOT NULL,
+			created_at TIMESTAMP DEFAULT NOW(),
+			updated_at TIMESTAMP DEFAULT NOW()
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create lecturers table: %v", err)
+	}
+
+	// Check if students table exists
+	var studentsExists bool
+	err = PostgresDB.QueryRow(`
+		SELECT EXISTS (
+			SELECT FROM information_schema.tables 
+			WHERE table_schema = 'public' 
+			AND table_name = 'students'
+		);
+	`).Scan(&studentsExists)
+	if err != nil {
+		return fmt.Errorf("failed to check students table: %v", err)
+	}
+
+	if !studentsExists {
+		// Create students table with proper foreign key
+		_, err = PostgresDB.Exec(`
+			CREATE TABLE students (
+				id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+				user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+				student_id VARCHAR(50) UNIQUE NOT NULL,
+				program_study VARCHAR(255) NOT NULL,
+				academic_year VARCHAR(10) NOT NULL,
+				advisor_id UUID REFERENCES users(id) ON DELETE SET NULL,
+				created_at TIMESTAMP DEFAULT NOW(),
+				updated_at TIMESTAMP DEFAULT NOW()
+			);
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create students table: %v", err)
+		}
+	} else {
+		// Check if advisor_id column has correct constraint
+		_, err = PostgresDB.Exec(`
+			ALTER TABLE students 
+			DROP CONSTRAINT IF EXISTS students_advisor_id_fkey;
+		`)
+		if err != nil {
+			log.Printf("Warning: Could not drop existing constraint: %v", err)
+		}
+		
+		// Add correct foreign key constraint
+		_, err = PostgresDB.Exec(`
+			ALTER TABLE students 
+			ADD CONSTRAINT students_advisor_id_fkey 
+			FOREIGN KEY (advisor_id) REFERENCES users(id) ON DELETE SET NULL;
+		`)
+		if err != nil {
+			log.Printf("Warning: Could not add foreign key constraint: %v", err)
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("failed to create students table: %v", err)
+	}
+
+	// Check if permissions table exists and has correct structure
+	var permissionsExists bool
+	err = PostgresDB.QueryRow(`
+		SELECT EXISTS (
+			SELECT FROM information_schema.tables 
+			WHERE table_schema = 'public' 
+			AND table_name = 'permissions'
+		);
+	`).Scan(&permissionsExists)
+	if err != nil {
+		return fmt.Errorf("failed to check permissions table: %v", err)
+	}
+
+	if !permissionsExists {
+		// Create permissions table with correct structure
+		_, err = PostgresDB.Exec(`
+			CREATE TABLE permissions (
+				id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+				role_id UUID NOT NULL REFERENCES roles(id),
+				resource VARCHAR(100) NOT NULL,
+				action VARCHAR(100) NOT NULL,
+				created_at TIMESTAMP DEFAULT NOW(),
+				UNIQUE(role_id, resource, action)
+			);
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to create permissions table: %v", err)
+		}
+
+		// Insert default permissions
+		_, err = PostgresDB.Exec(`
+			INSERT INTO permissions (role_id, resource, action) 
+			SELECT r.id, p.resource, p.action FROM roles r
+			CROSS JOIN (VALUES 
+				('achievements', 'create'),
+				('achievements', 'read'),
+				('achievements', 'update'),
+				('achievements', 'delete'),
+				('achievements', 'view_advisee'),
+				('achievements', 'verify')
+			) AS p(resource, action)
+			WHERE r.name IN ('student', 'lecturer', 'admin');
+		`)
+		if err != nil {
+			return fmt.Errorf("failed to insert default permissions: %v", err)
+		}
+	} else {
+		// Check if permissions table has role_id column
+		var hasRoleID bool
+		err = PostgresDB.QueryRow(`
+			SELECT EXISTS (
+				SELECT FROM information_schema.columns 
+				WHERE table_name = 'permissions' 
+				AND column_name = 'role_id'
+			);
+		`).Scan(&hasRoleID)
+		if err != nil {
+			return fmt.Errorf("failed to check role_id column: %v", err)
+		}
+
+		if !hasRoleID {
+			// Add role_id column if it doesn't exist
+			_, err = PostgresDB.Exec(`
+				ALTER TABLE permissions 
+				ADD COLUMN role_id UUID REFERENCES roles(id);
+			`)
+			if err != nil {
+				return fmt.Errorf("failed to add role_id column: %v", err)
+			}
+		}
+	}
+
+	log.Println("Database schema setup completed successfully")
+	return nil
+}
+
+// CreateDefaultUsers creates default admin user if not exists
+func CreateDefaultUsers() error {
+	// Check if admin user exists
+	var count int
+	err := PostgresDB.QueryRow("SELECT COUNT(*) FROM users WHERE username = 'admin'").Scan(&count)
+	if err != nil {
+		return fmt.Errorf("failed to check admin user: %v", err)
+	}
+
+	if count > 0 {
+		log.Println("Default admin user already exists")
+		return nil
+	}
+
+	// Get admin role ID
+	var adminRoleID string
+	err = PostgresDB.QueryRow("SELECT id FROM roles WHERE name = 'admin'").Scan(&adminRoleID)
+	if err != nil {
+		return fmt.Errorf("failed to get admin role ID: %v", err)
+	}
+
+	// Create admin user
+	_, err = PostgresDB.Exec(`
+		INSERT INTO users (username, email, password, full_name, role_id, is_active)
+		VALUES ('admin', 'admin@unair.ac.id', '$2a$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', 'System Administrator', $1, true)
+	`, adminRoleID)
+	if err != nil {
+		return fmt.Errorf("failed to create admin user: %v", err)
+	}
+
+	log.Println("Default admin user created successfully")
+	return nil
+}
+// ResetDatabase drops and recreates all tables (for development only)
+func ResetDatabase() error {
+	log.Println("WARNING: Resetting database - all data will be lost!")
+	
+	// Drop tables in reverse order due to foreign key constraints
+	tables := []string{"permissions", "students", "lecturers", "users", "roles"}
+	
+	for _, table := range tables {
+		_, err := PostgresDB.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", table))
+		if err != nil {
+			return fmt.Errorf("failed to drop table %s: %v", table, err)
+		}
+	}
+	
+	log.Println("All tables dropped successfully")
+	
+	// Recreate schema
+	return SetupSchema()
+}
+
+// CheckDatabaseHealth checks if all required tables exist with correct structure
+func CheckDatabaseHealth() error {
+	requiredTables := []string{"roles", "users", "lecturers", "students", "permissions"}
+	
+	for _, table := range requiredTables {
+		var exists bool
+		err := PostgresDB.QueryRow(`
+			SELECT EXISTS (
+				SELECT FROM information_schema.tables 
+				WHERE table_schema = 'public' 
+				AND table_name = $1
+			);
+		`, table).Scan(&exists)
+		
+		if err != nil {
+			return fmt.Errorf("failed to check table %s: %v", table, err)
+		}
+		
+		if !exists {
+			return fmt.Errorf("required table %s does not exist", table)
+		}
+	}
+	
+	log.Println("Database health check passed")
 	return nil
 }
